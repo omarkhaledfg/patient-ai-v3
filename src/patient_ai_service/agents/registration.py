@@ -38,6 +38,40 @@ class RegistrationAgent(BaseAgent):
         super().__init__(agent_name="Registration", **kwargs)
         self.db_client = db_client or DbOpsClient()
 
+    async def on_activated(self, session_id: str, reasoning: Any):
+        """
+        Set up registration workflow when agent is activated.
+
+        Args:
+            session_id: Session identifier
+            reasoning: ReasoningOutput from reasoning engine
+        """
+        # Get current registration state
+        reg_state = self.state_manager.get_registration_state(session_id)
+        global_state = self.state_manager.get_global_state(session_id)
+
+        # If registration not started, initialize it
+        if not reg_state.form_completion:
+            logger.info(f"Initializing registration workflow for session {session_id}")
+
+            # Determine missing fields
+            missing_fields = []
+            for field in self.REQUIRED_FIELDS:
+                # Check if field exists in patient profile
+                profile_value = getattr(global_state.patient_profile, field, None)
+                if not profile_value:
+                    missing_fields.append(field)
+
+            # Update registration state
+            self.state_manager.update_registration_state(
+                session_id,
+                current_section="personal_info",
+                workflow_step="collecting",
+                missing_fields=missing_fields
+            )
+
+            logger.info(f"Registration initialized with {len(missing_fields)} missing fields")
+
     def _register_tools(self):
         """Register registration tools."""
 

@@ -44,6 +44,9 @@ class BaseAgent(ABC):
         # Conversation history per session
         self.conversation_history: Dict[str, List[Dict[str, str]]] = {}
 
+        # Minimal context from reasoning engine (per session)
+        self._context: Dict[str, Dict[str, Any]] = {}
+
         # Tool registry
         self._tools: Dict[str, Callable] = {}
         self._tool_schemas: List[Dict[str, Any]] = []
@@ -52,6 +55,62 @@ class BaseAgent(ABC):
         self._register_tools()
 
         logger.info(f"Initialized {self.agent_name} agent")
+
+    async def on_activated(self, session_id: str, reasoning: Any):
+        """
+        Called when agent is selected for a session.
+        Override in subclasses to set up necessary state.
+
+        Args:
+            session_id: Session identifier
+            reasoning: ReasoningOutput from reasoning engine
+
+        Default implementation does nothing.
+        """
+        pass
+
+    def set_context(self, session_id: str, context: Dict[str, Any]):
+        """
+        Set minimal context for this session.
+
+        Args:
+            session_id: Session identifier
+            context: Minimal context dict from reasoning engine
+        """
+        self._context[session_id] = context
+        logger.debug(f"Set context for {self.agent_name} session {session_id}: {context}")
+
+    def _get_context_note(self, session_id: str) -> str:
+        """
+        Generate a brief context note for the system prompt.
+
+        Args:
+            session_id: Session identifier
+
+        Returns:
+            Brief context note string, or empty string if no context
+        """
+        context = self._context.get(session_id, {})
+        if not context:
+            return ""
+
+        # Build minimal context note - just essentials
+        parts = []
+
+        if "user_wants" in context:
+            parts.append(f"User wants: {context['user_wants']}")
+
+        if "action" in context:
+            parts.append(f"Suggested action: {context['action']}")
+
+        if "prior_context" in context:
+            parts.append(f"Context: {context['prior_context']}")
+
+        if not parts:
+            return ""
+
+        # Return formatted context note
+        return "\n[CONVERSATION CONTEXT]\n" + "\n".join(parts) + "\n"
 
     @abstractmethod
     def _get_system_prompt(self, session_id: str) -> str:

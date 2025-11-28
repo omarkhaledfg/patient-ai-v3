@@ -35,6 +35,36 @@ class AppointmentManagerAgent(BaseAgent):
         super().__init__(agent_name="AppointmentManager", **kwargs)
         self.db_client = db_client or DbOpsClient()
 
+    async def on_activated(self, session_id: str, reasoning: Any):
+        """
+        Set up appointment workflow when agent is activated.
+
+        Args:
+            session_id: Session identifier
+            reasoning: ReasoningOutput from reasoning engine
+        """
+        # Determine operation type from routing action
+        action = reasoning.routing.action.lower() if reasoning.routing.action else ""
+
+        operation_type = "booking"  # Default
+        if "reschedule" in action or "change" in action:
+            operation_type = "rescheduling"
+        elif "cancel" in action:
+            operation_type = "cancellation"
+        elif "check" in action or "view" in action or "list" in action:
+            operation_type = "checking"
+        elif "book" in action or "schedule" in action or "appointment" in action:
+            operation_type = "booking"
+
+        # Initialize appointment workflow state
+        self.state_manager.update_appointment_state(
+            session_id,
+            workflow_step="gathering_info",
+            operation_type=operation_type
+        )
+
+        logger.info(f"Appointment workflow initialized: operation_type={operation_type}, session={session_id}")
+
     def _register_tools(self):
         """Register appointment-related tools."""
 
