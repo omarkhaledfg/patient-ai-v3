@@ -96,6 +96,27 @@ class AppointmentAgentState(BaseModel):
     operation_type: Optional[str] = None  # "booking", "rescheduling", "canceling"
     target_appointment_id: Optional[str] = None
 
+    # Lightweight booking state tracking (Phase 2.1)
+    booking_pending: bool = False
+    last_booking_attempt: Optional[Dict[str, Any]] = None  # {doctor_id, date, time, timestamp}
+    last_verified_appointment_id: Optional[str] = None
+
+    def mark_booking_pending(self, doctor_id: str, date: str, time: str):
+        """Mark that booking was attempted but not yet verified."""
+        self.booking_pending = True
+        self.last_booking_attempt = {
+            "doctor_id": doctor_id,
+            "date": date,
+            "time": time,
+            "timestamp": datetime.now().isoformat()
+        }
+
+    def mark_booking_verified(self, appointment_id: str):
+        """Mark that booking was verified in database."""
+        self.booking_pending = False
+        self.last_verified_appointment_id = appointment_id
+        self.last_booking_attempt = None
+
     class Config:
         json_schema_extra = {
             "example": {

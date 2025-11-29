@@ -208,28 +208,77 @@ class BaseAgent(ABC):
         # Extract required parameters from tool result
         required_params = tool_result.get("required_parameters", {})
         
-        # Get doctor_id from recent find_doctor_by_name result in conversation history
-        logger.info(f"🔍 Auto-booking: Looking for doctor_id in conversation history...")
+        # Get doctor_id from recent list_doctors result in conversation history
+        # Patient mentions doctor by name (e.g., "Dr. Smith"), not by ID
+        # So we need to find the list_doctors result and match the doctor name
+        logger.info(f"🔍 Auto-booking: Looking for doctor_id from list_doctors result...")
         doctor_id = None
         history = self.conversation_history.get(session_id, [])
         logger.info(f"🔍 Auto-booking: Checking {len(history)} messages in history")
+
+        # First, find the most recent list_doctors result
+        doctors_list = None
         for msg in reversed(history):
             if "Tool result:" in msg.get("content", ""):
                 try:
                     result_str = msg["content"].replace("Tool result: ", "")
                     result_data = json.loads(result_str)
-                    logger.debug(f"🔍 Auto-booking: Checking tool result: {list(result_data.keys())[:5]}")
-                    if result_data.get("success") and result_data.get("id"):
-                        # This looks like a doctor result
-                        doctor_id = result_data.get("id")
-                        logger.info(f"✅ Auto-booking: Found doctor_id in history: {doctor_id}")
+                    # Check if this is a list_doctors result
+                    if result_data.get("success") and "doctors" in result_data:
+                        doctors_list = result_data.get("doctors", [])
+                        logger.info(f"✅ Auto-booking: Found list_doctors result with {len(doctors_list)} doctors")
                         break
                 except Exception as e:
                     logger.debug(f"Error parsing tool result: {e}")
                     continue
-        
+
+        if not doctors_list:
+            logger.warning("⚠️ Auto-booking skipped: Could not find list_doctors result in history")
+            return None
+
+        # Now, extract doctor name from user messages
+        # Look for doctor name in recent user messages
+        doctor_name_mentioned = None
+        for msg in reversed(history):
+            if msg.get("role") == "user":
+                content = msg.get("content", "").lower()
+                # Split content into words for word-boundary matching
+                content_words = content.split()
+
+                # Check each doctor in the list to see if their name is mentioned
+                for doctor in doctors_list:
+                    doctor_full_name = doctor.get("name", "").lower()
+                    matched = False
+
+                    # Extract first and last name from "Dr. FirstName LastName"
+                    if " " in doctor_full_name:
+                        parts = doctor_full_name.split()
+                        last_name = parts[-1]
+                        # First name is the word after "dr." if it exists
+                        first_name = parts[1] if len(parts) > 1 else ""
+
+                        # Check if user mentioned the doctor's name (word-boundary matching)
+                        # This prevents false positives like "ali" matching "allergy"
+                        if (last_name in content_words or
+                            first_name in content_words or
+                            doctor_full_name in content):
+                            matched = True
+                    else:
+                        # Single name doctor (no space) - check full name
+                        if doctor_full_name in content_words or doctor_full_name in content:
+                            matched = True
+
+                    if matched:
+                        doctor_name_mentioned = doctor.get("name")
+                        doctor_id = doctor.get("id")
+                        logger.info(f"✅ Auto-booking: Found doctor '{doctor_name_mentioned}' (ID: {doctor_id}) in user message: '{content[:100]}'")
+                        break
+
+                if doctor_id:
+                    break
+
         if not doctor_id:
-            logger.warning("⚠️ Auto-booking skipped: Could not find doctor_id in history")
+            logger.warning("⚠️ Auto-booking skipped: Could not match doctor name from user messages to list_doctors result")
             return None
         
         # Build booking parameters
