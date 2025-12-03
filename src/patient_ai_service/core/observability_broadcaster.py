@@ -74,6 +74,10 @@ class ObservabilityBroadcaster:
     async def broadcast_session_summary(self, summary: Dict[str, Any]):
         """Broadcast a session summary."""
         await self.broadcast("session_summary", summary)
+    
+    async def broadcast_custom_metric(self, metric: Dict[str, Any]):
+        """Broadcast a custom metric event."""
+        await self.broadcast("custom_metric", metric)
 
 
 # Global broadcaster instance

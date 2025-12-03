@@ -9,6 +9,7 @@ from typing import Dict, Any, Optional, Tuple
 
 from .base_agent import BaseAgent
 from patient_ai_service.models.enums import Language
+from patient_ai_service.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +92,7 @@ Language code:"""
             response = self.llm_client.create_message(
                 system=self._get_system_prompt("detection"),
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.1
+                temperature=settings.translation_temperature
             )
 
             # Extract language code
@@ -142,12 +143,21 @@ Response:"""
             response = self.llm_client.create_message(
                 system=self._get_system_prompt("detection"),
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.1
+                temperature=settings.translation_temperature
             )
 
-            # Parse JSON response
+            # Parse JSON response - extract from markdown if needed
             import json
-            result = json.loads(response.strip())
+            import re
+
+            # Try to extract JSON from response (handles markdown code blocks)
+            # Claude often returns JSON wrapped like: ```json\n{...}\n```
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if not json_match:
+                logger.error(f"No JSON found in language detection response: {response[:200]}")
+                return "en", None
+
+            result = json.loads(json_match.group())
 
             language = result.get("language", "en")
             dialect = result.get("dialect")
@@ -163,6 +173,7 @@ Response:"""
 
         except Exception as e:
             logger.error(f"Error detecting language/dialect: {e}")
+            logger.debug(f"Response was: {response[:200] if 'response' in locals() else 'N/A'}")
             return "en", None
 
     async def translate_to_english(self, text: str, source_lang: str) -> str:
@@ -193,7 +204,7 @@ Translation:"""
             response = self.llm_client.create_message(
                 system=self._get_system_prompt("translation"),
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.3
+                temperature=settings.translation_temperature
             )
 
             translated = response.strip()
@@ -244,7 +255,7 @@ Translation:"""
             response = self.llm_client.create_message(
                 system=self._get_system_prompt("translation"),
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.3
+                temperature=settings.translation_temperature
             )
 
             translated = response.strip()
@@ -284,7 +295,7 @@ Translation:"""
             response = self.llm_client.create_message(
                 system=self._get_system_prompt("translation"),
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.3
+                temperature=settings.translation_temperature
             )
 
             translated = response.strip()
@@ -336,7 +347,7 @@ Translation:"""
             response = self.llm_client.create_message(
                 system=self._get_system_prompt("translation"),
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.3
+                temperature=settings.translation_temperature
             )
 
             translated = response.strip()

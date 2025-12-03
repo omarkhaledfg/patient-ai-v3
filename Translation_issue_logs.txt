@@ -1,0 +1,134 @@
+carebot-patient-ai-v3-local  | DEBUG:    < TEXT '{"type":"message","session_id":"+97153497405","...د يوم السبت الساعة ٢؟"}' [121 bytes]
+carebot-patient-ai-v3-local  | DEBUG:    > TEXT '{"type":"typing","session_id":"+97153497405","is_typing":true}' [62 bytes]
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:27,254 - patient_ai_service.core.orchestrator - INFO - Processing message for session: +97153497405
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:27,255 - patient_ai_service.core.orchestrator - INFO - 🔍 _ensure_patient_loaded called for session: +97153497405
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:27,256 - patient_ai_service.core.orchestrator - INFO - ✅ Patient already loaded in state: 7b262a99-9491-4a6c-b5ae-fcd6e9fd319f
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:31,027 - httpx - INFO - HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 200 OK"
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:31,029 - patient_ai_service.agents.translation - ERROR - Error detecting language/dialect: Expecting value: line 1 column 1 (char 0)
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:31,032 - patient_ai_service.core.orchestrator - INFO - Language: en | Message: 'ممكن احجز معاد يوم السبت الساعة ٢؟...' → 'ممكن احجز معاد يوم السبت الساعة ٢؟...'
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:31,032 - patient_ai_service.core.orchestrator - INFO - Detected language: en
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,755 - httpx - INFO - HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 200 OK"
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,769 - patient_ai_service.core.reasoning - INFO - Injected language context into minimal_context: en
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,771 - patient_ai_service.core.conversation_memory - INFO - Updated facts for session +97153497405: ['new_appointment_request', 'language_preference']
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,774 - patient_ai_service.core.reasoning - INFO - Reasoning complete for session +97153497405: agent=appointment_manager, urgency=routine, sentiment=neutral
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,774 - patient_ai_service.core.reasoning - INFO - ================================================================================
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,774 - patient_ai_service.core.reasoning - INFO - REASONING OUTPUT (Full Structure):
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,774 - patient_ai_service.core.reasoning - INFO - ================================================================================
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,774 - patient_ai_service.core.reasoning - INFO - UNDERSTANDING:
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,774 - patient_ai_service.core.reasoning - INFO -   - what_user_means: User wants to book a new appointment on Saturday at 2 PM. This appears to be a separate request from the three consecutive appointments already booked for December 10th.
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,774 - patient_ai_service.core.reasoning - INFO -   - is_continuation: False
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,774 - patient_ai_service.core.reasoning - INFO -   - sentiment: neutral
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,775 - patient_ai_service.core.reasoning - INFO -   - is_conversation_restart: False
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,775 - patient_ai_service.core.reasoning - INFO - ROUTING:
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,775 - patient_ai_service.core.reasoning - INFO -   - agent: appointment_manager
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,775 - patient_ai_service.core.reasoning - INFO -   - action: Book a new appointment for Saturday at 2:00 PM - need to clarify which Saturday and what service
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,775 - patient_ai_service.core.reasoning - INFO -   - urgency: routine
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,775 - patient_ai_service.core.reasoning - INFO - MEMORY_UPDATES:
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,775 - patient_ai_service.core.reasoning - INFO -   - new_facts: {
+carebot-patient-ai-v3-local  |     "new_appointment_request": "Saturday at 2 PM",
+carebot-patient-ai-v3-local  |     "language_preference": "Arabic"
+carebot-patient-ai-v3-local  | }
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,775 - patient_ai_service.core.reasoning - INFO -   - system_action: 'booked_three_consecutive_appointments_december_10th' 
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,776 - patient_ai_service.core.reasoning - INFO -   - awaiting: 'specific_saturday_date_and_service_type' 
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,776 - patient_ai_service.core.reasoning - INFO - RESPONSE_GUIDANCE:
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,776 - patient_ai_service.core.reasoning - INFO -   - tone: helpful
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,776 - patient_ai_service.core.reasoning - INFO -   - minimal_context: {
+carebot-patient-ai-v3-local  |     "user_wants": "Book another appointment on Saturday at 2 PM",
+carebot-patient-ai-v3-local  |     "action": "Clarify which Saturday and what service needed",
+carebot-patient-ai-v3-local  |     "prior_context": "Already has 3 appointments booked for Dec 10th",
+carebot-patient-ai-v3-local  |     "current_language": "en",
+carebot-patient-ai-v3-local  |     "current_dialect": null
+carebot-patient-ai-v3-local  | }
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,777 - patient_ai_service.core.reasoning - INFO -   - plan: 1. Clarify which Saturday (this week, next week, specific date), 2. Ask what service/reason for this appointment, 3. Check doctor availability for that date/time, 4. Book the appointment
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,777 - patient_ai_service.core.reasoning - INFO - REASONING_CHAIN:
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,778 - patient_ai_service.core.reasoning - INFO -   1. Step 1: User just thanked us for booking 3 appointments on December 10th, now asking to book 'معاد' (appointment) on Saturday at 2 PM
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,778 - patient_ai_service.core.reasoning - INFO -   2. Step 2: This is clearly a NEW appointment request, not related to the December 10th bookings. User is communicating in Arabic now.
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,778 - patient_ai_service.core.reasoning - INFO -   3. Step 3: Need to clarify: (a) which Saturday - could be this Saturday, next Saturday, or a specific date, and (b) what service they need for this appointment
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,778 - patient_ai_service.core.reasoning - INFO -   4. Step 4: Patient is already registered (ID: 7b262a99-9491-4a6c-b5ae-fcd6e9fd319f), so can proceed directly to booking once details are clarified
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,778 - patient_ai_service.core.reasoning - INFO - ================================================================================
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,779 - patient_ai_service.core.orchestrator - INFO - Reasoning: agent=appointment_manager, urgency=routine, sentiment=neutral
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,779 - patient_ai_service.core.orchestrator - INFO - ================================================================================
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,779 - patient_ai_service.core.orchestrator - INFO - ORCHESTRATOR: Reasoning Output Received
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,779 - patient_ai_service.core.orchestrator - INFO - ================================================================================
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,780 - patient_ai_service.core.orchestrator - INFO - Session: +97153497405
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,781 - patient_ai_service.core.orchestrator - INFO - User Message: ممكن احجز معاد يوم السبت الساعة ٢؟...
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,781 - patient_ai_service.core.orchestrator - INFO - Routing Decision: appointment_manager -> Book a new appointment for Saturday at 2:00 PM - need to clarify which Saturday and what service (urgency: routine)
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,781 - patient_ai_service.core.orchestrator - INFO - Understanding: User wants to book a new appointment on Saturday at 2 PM. This appears to be a separate request from the three consecutive appointments already booked for December 10th.
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,781 - patient_ai_service.core.orchestrator - INFO - Sentiment: neutral, Continuation: False
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,781 - patient_ai_service.core.orchestrator - INFO - Memory Updates:
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,782 - patient_ai_service.core.orchestrator - INFO -   - system_action: booked_three_consecutive_appointments_december_10th
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,782 - patient_ai_service.core.orchestrator - INFO -   - awaiting: specific_saturday_date_and_service_type
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,782 - patient_ai_service.core.orchestrator - INFO -   - new_facts: {
+carebot-patient-ai-v3-local  |   "new_appointment_request": "Saturday at 2 PM",
+carebot-patient-ai-v3-local  |   "language_preference": "Arabic"
+carebot-patient-ai-v3-local  | }
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,783 - patient_ai_service.core.orchestrator - INFO - Response Guidance: {
+carebot-patient-ai-v3-local  |   "user_wants": "Book another appointment on Saturday at 2 PM",
+carebot-patient-ai-v3-local  |   "action": "Clarify which Saturday and what service needed",
+carebot-patient-ai-v3-local  |   "prior_context": "Already has 3 appointments booked for Dec 10th",
+carebot-patient-ai-v3-local  |   "current_language": "en",
+carebot-patient-ai-v3-local  |   "current_dialect": null
+carebot-patient-ai-v3-local  | }
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,783 - patient_ai_service.core.orchestrator - INFO - Agent Plan: 1. Clarify which Saturday (this week, next week, specific date), 2. Ask what service/reason for this appointment, 3. Check doctor availability for that date/time, 4. Book the appointment
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,783 - patient_ai_service.core.orchestrator - INFO - ================================================================================
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,787 - patient_ai_service.agents.appointment_manager - INFO - ================================================================================
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,787 - patient_ai_service.agents.appointment_manager - INFO - APPOINTMENT_MANAGER: on_activated() - Reasoning Output Received
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,787 - patient_ai_service.agents.appointment_manager - INFO - ================================================================================
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,788 - patient_ai_service.agents.appointment_manager - INFO - Session: +97153497405
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,788 - patient_ai_service.agents.appointment_manager - INFO - Routing:
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,788 - patient_ai_service.agents.appointment_manager - INFO -   - agent: appointment_manager
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,788 - patient_ai_service.agents.appointment_manager - INFO -   - action: Book a new appointment for Saturday at 2:00 PM - need to clarify which Saturday and what service
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,788 - patient_ai_service.agents.appointment_manager - INFO -   - urgency: routine
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,788 - patient_ai_service.agents.appointment_manager - INFO - Understanding:
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,789 - patient_ai_service.agents.appointment_manager - INFO -   - what_user_means: User wants to book a new appointment on Saturday at 2 PM. This appears to be a separate request from the three consecutive appointments already booked for December 10th.
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,789 - patient_ai_service.agents.appointment_manager - INFO -   - sentiment: neutral
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,789 - patient_ai_service.agents.appointment_manager - INFO -   - is_continuation: False
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,789 - patient_ai_service.agents.appointment_manager - INFO - Memory Updates:
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,789 - patient_ai_service.agents.appointment_manager - INFO -   - system_action: booked_three_consecutive_appointments_december_10th
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,789 - patient_ai_service.agents.appointment_manager - INFO -   - awaiting: specific_saturday_date_and_service_type
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,790 - patient_ai_service.agents.appointment_manager - INFO -   - new_facts: {
+carebot-patient-ai-v3-local  |   "new_appointment_request": "Saturday at 2 PM",
+carebot-patient-ai-v3-local  |   "language_preference": "Arabic"
+carebot-patient-ai-v3-local  | }
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,791 - patient_ai_service.agents.appointment_manager - INFO - Response Guidance: {
+carebot-patient-ai-v3-local  |   "user_wants": "Book another appointment on Saturday at 2 PM",
+carebot-patient-ai-v3-local  |   "action": "Clarify which Saturday and what service needed",
+carebot-patient-ai-v3-local  |   "prior_context": "Already has 3 appointments booked for Dec 10th",
+carebot-patient-ai-v3-local  |   "current_language": "en",
+carebot-patient-ai-v3-local  |   "current_dialect": null
+carebot-patient-ai-v3-local  | }
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,791 - patient_ai_service.agents.appointment_manager - INFO - ================================================================================
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,791 - patient_ai_service.agents.appointment_manager - INFO - 📋 PLAN FOR APPOINTMENT MANAGER:
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,791 - patient_ai_service.agents.appointment_manager - INFO - ================================================================================
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,792 - patient_ai_service.agents.appointment_manager - INFO - 1. Clarify which Saturday (this week, next week, specific date), 2. Ask what service/reason for this appointment, 3. Check doctor availability for that date/time, 4. Book the appointment
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,792 - patient_ai_service.agents.appointment_manager - INFO - ================================================================================
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,792 - patient_ai_service.agents.appointment_manager - INFO - ================================================================================
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,795 - patient_ai_service.agents.appointment_manager - INFO - Appointment workflow initialized: operation_type=booking, session=+97153497405
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,798 - patient_ai_service.agents.appointment_manager - INFO - 🔍 AppointmentManager._get_system_prompt - session: +97153497405, patient_id: 7b262a99-9491-4a6c-b5ae-fcd6e9fd319f, registered: True
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,799 - patient_ai_service.agents.base_agent - WARNING - Non-English message detected in AppointmentManager agent: ممكن احجز معاد يوم السبت الساعة ٢؟...
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,799 - patient_ai_service.agents.base_agent - ERROR - TRANSLATION BARRIER BREACH: Non-English text reached AppointmentManager agent. Text: 'ممكن احجز معاد يوم السبت الساعة ٢؟...'
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,799 - patient_ai_service.agents.base_agent - INFO - Agent Translation initialized with max_tool_iterations=10
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:43,799 - patient_ai_service.agents.base_agent - INFO - Initialized Translation agent
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:47,463 - httpx - INFO - HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 200 OK"
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:47,465 - patient_ai_service.agents.translation - ERROR - Error detecting language/dialect: Expecting value: line 1 column 1 (char 0)
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:47,468 - patient_ai_service.agents.appointment_manager - INFO - 🔍 AppointmentManager._get_system_prompt - session: +97153497405, patient_id: 7b262a99-9491-4a6c-b5ae-fcd6e9fd319f, registered: True
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:53,277 - httpx - INFO - HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 200 OK"
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:53,280 - patient_ai_service.agents.appointment_manager - INFO - 🔍 AppointmentManager._get_system_prompt - session: +97153497405, patient_id: 7b262a99-9491-4a6c-b5ae-fcd6e9fd319f, registered: True
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:53,280 - patient_ai_service.core.orchestrator - INFO - Validation layer DISABLED - skipping validation
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:53,280 - patient_ai_service.core.orchestrator - INFO - Finalization layer DISABLED - using agent response as-is
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:53,283 - patient_ai_service.core.orchestrator - INFO - Response generated by appointment_manager
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:53,284 - patient_ai_service.core.observability - INFO - ================================================================================
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:53,284 - patient_ai_service.core.observability - INFO - OBSERVABILITY SUMMARY - Session: +97153497405
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:53,284 - patient_ai_service.core.observability - INFO - ================================================================================
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:53,284 - patient_ai_service.core.observability - INFO - Pipeline Steps: 55
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:53,285 - patient_ai_service.core.observability - INFO - Total Duration: 512386.11ms
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:53,285 - patient_ai_service.core.observability - INFO - Total Tokens: 85831 (Input: 80877, Output: 4954)
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:53,285 - patient_ai_service.core.observability - INFO - Total Cost: $0.316941
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:53,286 - patient_ai_service.core.observability - INFO - Reasoning Chain: 27 steps
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:53,286 - patient_ai_service.core.observability - INFO - Agent: AppointmentManager
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:53,286 - patient_ai_service.core.observability - INFO - Agent LLM Calls: 1
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:53,287 - patient_ai_service.core.observability - INFO - Agent Tool Executions: 5
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:53,287 - patient_ai_service.core.observability - INFO - Agent Tokens: 11915
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:53,287 - patient_ai_service.core.observability - INFO - Agent Cost: $0.037449
+carebot-patient-ai-v3-local  | 2025-12-03 16:35:53,288 - patient_ai_service.core.observability - INFO - ================================================================================
+carebot-patient-ai-v3-local  | DEBUG:    % sending keepalive ping

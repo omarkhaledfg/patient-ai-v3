@@ -32,6 +32,9 @@ class AppointmentManagerAgent(BaseAgent):
     """
 
     def __init__(self, db_client: Optional[DbOpsClient] = None, **kwargs):
+        # Pass max_tool_iterations through kwargs or set explicitly
+        if 'max_tool_iterations' not in kwargs:
+            kwargs['max_tool_iterations'] = 15  # Higher for complex booking flows
         super().__init__(agent_name="AppointmentManager", **kwargs)
         self.db_client = db_client or DbOpsClient()
 
@@ -548,6 +551,29 @@ Agent: [Calls list_doctors]
        "We have Dr. Mohammed Atef (General Dentist), Dr. Sarah Johnson (Orthodontist)..."
 
 REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, execute all necessary tools, validate completeness, then respond. Don't rush to respond before all tasks are done.
+
+⚠️ CRITICAL CONFIRMATION RULES ⚠️
+
+1. NEVER say "confirmed", "booked", "scheduled", or "done" until you receive
+   a tool result with "success": true AND "verified": true
+
+2. If a tool returns an error, NEVER claim the action succeeded
+
+3. If you're unsure whether an action completed, say:
+   "I'm checking on that..." and call the appropriate verification tool
+
+4. For multi-step tasks, confirm EACH step only after its tool succeeds
+
+5. FORBIDDEN PHRASES during tool execution:
+   - "Your appointment is confirmed"
+   - "I've booked..."
+   - "All set!"
+   - "Done!"
+
+   ALLOWED PHRASES during tool execution:
+   - "Let me check..."
+   - "Checking availability..."
+   - "Processing your request..."
 """
 
         return context
@@ -556,10 +582,23 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
 
     def tool_list_doctors(self, session_id: str) -> Dict[str, Any]:
         """Get list of available doctors."""
+        import time as time_module
+        start_time = time_module.time()
+        
+        logger.info("=" * 80)
+        logger.info("APPOINTMENT_MANAGER: tool_list_doctors() CALLED")
+        logger.info("=" * 80)
+        logger.info(f"Session ID: {session_id}")
+        logger.info(f"Input: session_id={session_id}")
+        
         try:
             doctors = self.db_client.get_doctors()
 
             if not doctors:
+                duration_ms = (time_module.time() - start_time) * 1000
+                logger.info(f"Output: {{'error': 'No doctors found'}}")
+                logger.info(f"Time taken: {duration_ms:.2f}ms")
+                logger.info("=" * 80)
                 return {"error": "No doctors found"}
 
             # Format doctor list
@@ -572,14 +611,25 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                     "languages": doc.get("languages", ["en"])
                 })
 
-            return {
+            duration_ms = (time_module.time() - start_time) * 1000
+            result = {
                 "success": True,
                 "doctors": doctor_list,
                 "count": len(doctor_list)
             }
+            
+            logger.info(f"Output: success=True, count={len(doctor_list)}")
+            logger.info(f"Time taken: {duration_ms:.2f}ms")
+            logger.info("=" * 80)
+            
+            return result
 
         except Exception as e:
+            duration_ms = (time_module.time() - start_time) * 1000
             logger.error(f"Error listing doctors: {e}")
+            logger.info(f"Output: {{'error': '{str(e)}'}}")
+            logger.info(f"Time taken: {duration_ms:.2f}ms")
+            logger.info("=" * 80)
             return {"error": str(e)}
 
     def tool_find_doctor_by_name(self, session_id: str, doctor_name: str) -> Dict[str, Any]:
@@ -793,18 +843,32 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
             - count: Number of ranges
             - message: Human-readable message
         """
+        import time as time_module
+        start_time = time_module.time()
+        
+        logger.info("=" * 80)
+        logger.info("APPOINTMENT_MANAGER: tool_check_availability() CALLED")
+        logger.info("=" * 80)
+        logger.info(f"Session ID: {session_id}")
+        logger.info(f"Input: doctor_id={doctor_id}, date={date}, requested_time={requested_time}")
+        
         try:
             # Validate doctor_id is a UUID (not a name)
             import uuid
             try:
                 uuid.UUID(doctor_id)
             except ValueError:
-                return {
+                duration_ms = (time_module.time() - start_time) * 1000
+                result = {
                     "success": False,
                     "error": "Invalid doctor_id format",
                     "message": f"doctor_id must be a UUID, not a name. Got: {doctor_id}. Please use find_doctor_by_name first to get the correct doctor ID.",
                     "suggestion": "Use find_doctor_by_name tool first to get the doctor's UUID"
                 }
+                logger.info(f"Output: {result}")
+                logger.info(f"Time taken: {duration_ms:.2f}ms")
+                logger.info("=" * 80)
+                return result
 
             # Get available timeslots (pre-filtered by API)
             available_timeslots = self.db_client.get_available_time_slots(
@@ -814,13 +878,18 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
             )
 
             if not available_timeslots:
-                return {
+                duration_ms = (time_module.time() - start_time) * 1000
+                result = {
                     "success": True,
                     "date": date,
                     "availability_ranges": [],
                     "count": 0,
                     "message": f"No available slots found for {date}"
                 }
+                logger.info(f"Output: {result}")
+                logger.info(f"Time taken: {duration_ms:.2f}ms")
+                logger.info("=" * 80)
+                return result
 
             # Merge consecutive timeslots into ranges
             logger.info(f"Using timeslots-based approach: {len(available_timeslots)} available slots")
@@ -834,16 +903,28 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
             )
 
             # Simple return - ONLY availability_ranges
-            return {
+            duration_ms = (time_module.time() - start_time) * 1000
+            result = {
                 "success": True,
                 "date": date,
                 "availability_ranges": availability_ranges,
                 "count": len(availability_ranges),
                 "message": f"Found {len(availability_ranges)} available time range(s) on {date}"
             }
+            
+            logger.info(f"Output: success=True, date={date}, count={len(availability_ranges)}")
+            logger.info(f"Availability ranges: {availability_ranges}")
+            logger.info(f"Time taken: {duration_ms:.2f}ms")
+            logger.info("=" * 80)
+            
+            return result
 
         except Exception as e:
+            duration_ms = (time_module.time() - start_time) * 1000
             logger.error(f"Error checking availability: {e}")
+            logger.info(f"Output: {{'error': '{str(e)}'}}")
+            logger.info(f"Time taken: {duration_ms:.2f}ms")
+            logger.info("=" * 80)
             return {"error": str(e)}
 
     async def _execute_booking_workflow(
@@ -1212,8 +1293,12 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
         correlation_id = session_id
         overall_start = time_module.time()
         
+        logger.info("=" * 80)
+        logger.info("APPOINTMENT_MANAGER: tool_book_appointment() CALLED")
+        logger.info("=" * 80)
+        logger.info(f"Session ID: {session_id}")
+        logger.info(f"Input: patient_id={patient_id}, doctor_id={doctor_id}, date={date}, time={time}, reason={reason}")
         logger.info(f"📋 BOOKING REQUEST: correlation_id={correlation_id}")
-        logger.info(f"   patient_id={patient_id}, doctor_id={doctor_id}, date={date}, time={time}, reason={reason}")
         
         try:
             # Execute workflow with overall timeout (20 seconds)
@@ -1276,6 +1361,9 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
             
             overall_duration_ms = (time_module.time() - overall_start) * 1000
             logger.info(f"📊 Overall workflow completed in {overall_duration_ms:.0f}ms - correlation_id={correlation_id}")
+            logger.info(f"Output: success={result.get('success')}, appointment_id={result.get('appointment_id', 'N/A')}")
+            logger.info(f"Time taken: {overall_duration_ms:.2f}ms")
+            logger.info("=" * 80)
             
             return result
             
@@ -1284,13 +1372,65 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
             logger.error(f"❌ BOOKING EXCEPTION: {e} - correlation_id={correlation_id}", exc_info=True)
             logger.info(f"📊 METRIC: appointment_booking.failure correlation_id={correlation_id} latency_ms={overall_duration_ms:.0f}")
             
-            return {
+            result = {
                 "success": False,
                 "error": str(e),
                 "error_code": "BOOKING_EXCEPTION",
                 "message": "Sorry — I couldn't schedule your appointment right now because of a system error. Would you like me to try again? (Yes / No)"
             }
-    
+            logger.info(f"Output: {result}")
+            logger.info(f"Time taken: {overall_duration_ms:.2f}ms")
+            logger.info("=" * 80)
+            
+            return result
+
+    async def _rollback_appointments(
+        self,
+        session_id: str,
+        appointment_ids: List[str],
+        correlation_id: str
+    ) -> Dict[str, Any]:
+        """
+        Rollback (cancel) previously booked appointments.
+
+        Used when a multi-booking operation partially fails.
+
+        Args:
+            session_id: Session identifier
+            appointment_ids: List of appointment IDs to cancel
+            correlation_id: Correlation ID for logging
+
+        Returns:
+            Dict with rollback results
+        """
+        logger.info(f"🔄 ROLLBACK: Cancelling {len(appointment_ids)} appointments - correlation_id={correlation_id}")
+
+        rollback_results = []
+        for apt_id in appointment_ids:
+            try:
+                result = self.db_client.cancel_appointment(
+                    appointment_id=apt_id,
+                    reason="Rollback due to partial multi-booking failure"
+                )
+                rollback_results.append({
+                    "appointment_id": apt_id,
+                    "cancelled": True
+                })
+                logger.info(f"✅ Rolled back appointment {apt_id}")
+            except Exception as e:
+                rollback_results.append({
+                    "appointment_id": apt_id,
+                    "cancelled": False,
+                    "error": str(e)
+                })
+                logger.error(f"❌ Failed to rollback appointment {apt_id}: {e}")
+
+        return {
+            "rollback_attempted": len(appointment_ids),
+            "rollback_succeeded": sum(1 for r in rollback_results if r.get("cancelled")),
+            "results": rollback_results
+        }
+
     def tool_book_multiple_appointments(
         self,
         session_id: str,
@@ -1326,8 +1466,12 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
         overall_start = time_module.time()
         correlation_id = session_id
 
+        logger.info("=" * 80)
+        logger.info("APPOINTMENT_MANAGER: tool_book_multiple_appointments() CALLED")
+        logger.info("=" * 80)
+        logger.info(f"Session ID: {session_id}")
+        logger.info(f"Input: patient_id={patient_id}, appointments_count={len(appointments)}")
         logger.info(f"📋 MULTIPLE BOOKING REQUEST: correlation_id={correlation_id}")
-        logger.info(f"   patient_id={patient_id}, appointments_count={len(appointments)}")
 
         # Validate inputs
         if not patient_id or patient_id.strip() == "":
@@ -1463,6 +1607,65 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
         logger.info(f"📊 Multiple booking completed in {overall_duration_ms:.0f}ms")
         logger.info(f"   Successful: {successful_count}/{len(appointments)}")
         logger.info(f"   Failed: {failed_count}/{len(appointments)}")
+        logger.info(f"Output: success={all_successful}, successful_count={successful_count}, failed_count={failed_count}")
+        logger.info(f"Time taken: {overall_duration_ms:.2f}ms")
+
+        # PHASE 4: Rollback on partial failure
+        rollback_result = None
+        if failed_count > 0 and successful_count > 0:
+            logger.warning(
+                f"⚠️ PARTIAL FAILURE: {successful_count} succeeded, {failed_count} failed - correlation_id={correlation_id}"
+            )
+
+            # Perform automatic rollback for consistency
+            successful_ids = [r.get("appointment_id") for r in successful_bookings if r.get("appointment_id")]
+            try:
+                loop = None
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+
+                if loop.is_running():
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        future = executor.submit(
+                            lambda: asyncio.run(
+                                self._rollback_appointments(
+                                    session_id=session_id,
+                                    appointment_ids=successful_ids,
+                                    correlation_id=correlation_id
+                                )
+                            )
+                        )
+                        rollback_result = future.result(timeout=10.0)
+                else:
+                    rollback_result = loop.run_until_complete(
+                        self._rollback_appointments(
+                            session_id=session_id,
+                            appointment_ids=successful_ids,
+                            correlation_id=correlation_id
+                        )
+                    )
+            except Exception as e:
+                logger.error(f"❌ Rollback failed: {e}")
+                rollback_result = {"error": str(e)}
+
+            return {
+                "success": False,
+                "error": "Partial booking failure - all bookings rolled back for consistency",
+                "message": (
+                    f"I wasn't able to book all {len(appointments)} appointments. "
+                    f"To keep things consistent, I've cancelled the ones that did go through. "
+                    f"Would you like me to try booking them again one at a time?"
+                ),
+                "results": results,
+                "rollback": rollback_result,
+                "successful_count": 0,  # After rollback
+                "failed_count": len(appointments),
+                "total_count": len(appointments),
+                "overall_duration_ms": round(overall_duration_ms, 2)
+            }
 
         # Build formatted message
         if all_successful:
@@ -1519,7 +1722,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 operation_type="multiple_booking"
             )
 
-        return {
+        result = {
             "success": all_successful,
             "results": results,
             "successful_count": successful_count,
@@ -1528,6 +1731,10 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
             "overall_duration_ms": round(overall_duration_ms, 2),
             "message": message
         }
+        
+        logger.info("=" * 80)
+        
+        return result
 
     def tool_check_patient_appointments(
         self,
@@ -1535,24 +1742,49 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
         patient_id: str
     ) -> Dict[str, Any]:
         """Get patient's appointments.""" 
+        import time as time_module
+        start_time = time_module.time()
+        
+        logger.info("=" * 80)
+        logger.info("APPOINTMENT_MANAGER: tool_check_patient_appointments() CALLED")
+        logger.info("=" * 80)
+        logger.info(f"Session ID: {session_id}")
+        logger.info(f"Input: patient_id={patient_id}")
+        
         try:
             appointments = self.db_client.get_patient_appointments(patient_id)
 
             if not appointments:
-                return {
+                duration_ms = (time_module.time() - start_time) * 1000
+                result = {
                     "success": True,
                     "appointments": [],
                     "message": "No appointments found"
                 }
+                logger.info(f"Output: {result}")
+                logger.info(f"Time taken: {duration_ms:.2f}ms")
+                logger.info("=" * 80)
+                return result
 
-            return {
+            duration_ms = (time_module.time() - start_time) * 1000
+            result = {
                 "success": True,
                 "appointments": appointments,
                 "count": len(appointments)
             }
+            
+            logger.info(f"Output: success=True, count={len(appointments)}")
+            logger.info(f"Time taken: {duration_ms:.2f}ms")
+            logger.info("=" * 80)
+            
+            return result
 
         except Exception as e:
+            duration_ms = (time_module.time() - start_time) * 1000
             logger.error(f"Error fetching appointments: {e}")
+            logger.info(f"Output: {{'error': '{str(e)}'}}")
+            logger.info(f"Time taken: {duration_ms:.2f}ms")
+            logger.info("=" * 80)
             return {"error": str(e)}
 
     def tool_cancel_appointment(
@@ -1562,19 +1794,42 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
         reason: str
     ) -> Dict[str, Any]:
         """Cancel an appointment."""
+        import time as time_module
+        start_time = time_module.time()
+        
+        logger.info("=" * 80)
+        logger.info("APPOINTMENT_MANAGER: tool_cancel_appointment() CALLED")
+        logger.info("=" * 80)
+        logger.info(f"Session ID: {session_id}")
+        logger.info(f"Input: appointment_id={appointment_id}, reason={reason}")
+        
         try:
             result = self.db_client.cancel_appointment(appointment_id, reason)
 
             if result:
-                return {
+                duration_ms = (time_module.time() - start_time) * 1000
+                output = {
                     "success": True,
                     "message": f"Appointment {appointment_id} cancelled successfully"
                 }
+                logger.info(f"Output: {output}")
+                logger.info(f"Time taken: {duration_ms:.2f}ms")
+                logger.info("=" * 80)
+                return output
             else:
-                return {"error": "Failed to cancel appointment"}
+                duration_ms = (time_module.time() - start_time) * 1000
+                output = {"error": "Failed to cancel appointment"}
+                logger.info(f"Output: {output}")
+                logger.info(f"Time taken: {duration_ms:.2f}ms")
+                logger.info("=" * 80)
+                return output
 
         except Exception as e:
+            duration_ms = (time_module.time() - start_time) * 1000
             logger.error(f"Error cancelling appointment: {e}")
+            logger.info(f"Output: {{'error': '{str(e)}'}}")
+            logger.info(f"Time taken: {duration_ms:.2f}ms")
+            logger.info("=" * 80)
             return {"error": str(e)}
 
     def tool_reschedule_appointment(
@@ -1585,6 +1840,15 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
         new_time: str
     ) -> Dict[str, Any]:
         """Reschedule an appointment."""
+        import time as time_module
+        start_time = time_module.time()
+        
+        logger.info("=" * 80)
+        logger.info("APPOINTMENT_MANAGER: tool_reschedule_appointment() CALLED")
+        logger.info("=" * 80)
+        logger.info(f"Session ID: {session_id}")
+        logger.info(f"Input: appointment_id={appointment_id}, new_date={new_date}, new_time={new_time}")
+        
         try:
             # Calculate new end time
             start_dt = datetime.strptime(new_time, "%H:%M")
@@ -1599,16 +1863,30 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
             )
 
             if result:
-                return {
+                duration_ms = (time_module.time() - start_time) * 1000
+                output = {
                     "success": True,
                     "appointment": result,
                     "message": f"Appointment rescheduled to {new_date} at {new_time}"
                 }
+                logger.info(f"Output: success=True, appointment_id={result.get('id', 'N/A')}")
+                logger.info(f"Time taken: {duration_ms:.2f}ms")
+                logger.info("=" * 80)
+                return output
             else:
-                return {"error": "Failed to reschedule appointment"}
+                duration_ms = (time_module.time() - start_time) * 1000
+                output = {"error": "Failed to reschedule appointment"}
+                logger.info(f"Output: {output}")
+                logger.info(f"Time taken: {duration_ms:.2f}ms")
+                logger.info("=" * 80)
+                return output
 
         except Exception as e:
+            duration_ms = (time_module.time() - start_time) * 1000
             logger.error(f"Error rescheduling appointment: {e}")
+            logger.info(f"Output: {{'error': '{str(e)}'}}")
+            logger.info(f"Time taken: {duration_ms:.2f}ms")
+            logger.info("=" * 80)
             return {"error": str(e)}
 
     def tool_update_appointment(

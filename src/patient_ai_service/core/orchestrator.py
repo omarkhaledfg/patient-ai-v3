@@ -120,19 +120,41 @@ class Orchestrator:
         from patient_ai_service.core.config import settings as config_settings
         obs_logger = get_observability_logger(session_id) if config_settings.enable_observability else None
         
+        logger.info("=" * 100)
+        logger.info("ORCHESTRATOR: process_message() CALLED")
+        logger.info("=" * 100)
+        logger.info(f"Session ID: {session_id}")
+        logger.info(f"Input Message: {message}")
+        logger.info(f"Language Hint: {language}")
+        logger.info(f"Pipeline Start Time: {pipeline_start_time}")
+        
         try:
             logger.info(f"Processing message for session: {session_id}")
 
             # Step 1: Load or initialize patient
+            step1_start = time.time()
+            logger.info("-" * 100)
+            logger.info("ORCHESTRATOR STEP 1: Load Patient")
+            logger.info("-" * 100)
             with obs_logger.pipeline_step(1, "load_patient", "orchestrator", {"session_id": session_id}) if obs_logger else nullcontext():
                 await self._ensure_patient_loaded(session_id)
+            step1_duration = (time.time() - step1_start) * 1000
+            logger.info(f"Step 1 completed in {step1_duration:.2f}ms")
 
             # Step 2: Translation (input)
+            step2_start = time.time()
+            logger.info("-" * 100)
+            logger.info("ORCHESTRATOR STEP 2: Translation (Input)")
+            logger.info("-" * 100)
+            logger.info(f"Original message: {message[:200]}")
             with obs_logger.pipeline_step(2, "translation_input", "translation", {"message": message[:100]}) if obs_logger else nullcontext():
                 translation_agent = self.agents["translation"]
 
                 # Detect language and dialect
+                detect_start = time.time()
                 detected_lang, detected_dialect = await translation_agent.detect_language_and_dialect(message)
+                detect_duration = (time.time() - detect_start) * 1000
+                logger.info(f"Language detection: {detected_lang}-{detected_dialect} (took {detect_duration:.2f}ms)")
 
                 # Get current language context
                 global_state = self.state_manager.get_global_state(session_id)
@@ -159,13 +181,17 @@ class Orchestrator:
 
                 # Translate to English if needed
                 if detected_lang != "en":
+                    translate_start = time.time()
                     english_message = await translation_agent.translate_to_english_with_dialect(
                         message,
                         detected_lang,
                         detected_dialect
                     )
+                    translate_duration = (time.time() - translate_start) * 1000
+                    logger.info(f"Translation to English: {message[:100]}... -> {english_message[:100]}... (took {translate_duration:.2f}ms)")
                 else:
                     english_message = message
+                    logger.info("No translation needed (already in English)")
 
                 # Validate translation succeeded
                 if not english_message or len(english_message.strip()) == 0:
@@ -195,12 +221,20 @@ class Orchestrator:
                             "detected_dialect": detected_dialect
                         }
                     )
+            step2_duration = (time.time() - step2_start) * 1000
+            logger.info(f"Step 2 completed in {step2_duration:.2f}ms")
 
             logger.info(f"Detected language: {language_context.get_full_language_code()}")
 
             # Step 3: Add user message to conversation memory
+            step3_start = time.time()
+            logger.info("-" * 100)
+            logger.info("ORCHESTRATOR STEP 3: Add to Memory")
+            logger.info("-" * 100)
             with obs_logger.pipeline_step(3, "add_to_memory", "memory_manager", {"message": english_message[:100]}) if obs_logger else nullcontext():
                 self.memory_manager.add_user_turn(session_id, english_message)
+            step3_duration = (time.time() - step3_start) * 1000
+            logger.info(f"Step 3 completed in {step3_duration:.2f}ms")
 
             # Step 4: Unified reasoning (replaces intent classification)
             global_state = self.state_manager.get_global_state(session_id)
@@ -213,6 +247,11 @@ class Orchestrator:
             }
 
             # Step 4: Unified reasoning
+            step4_start = time.time()
+            logger.info("-" * 100)
+            logger.info("ORCHESTRATOR STEP 4: Unified Reasoning")
+            logger.info("-" * 100)
+            logger.info(f"Reasoning input: message={english_message[:200]}..., patient_info={patient_info}")
             with obs_logger.pipeline_step(4, "reasoning", "reasoning_engine", {"message": english_message[:100]}) if obs_logger else nullcontext():
                 reasoning = await self.reasoning_engine.reason(
                     session_id,
@@ -231,6 +270,7 @@ class Orchestrator:
                         }
                     )
 
+            step4_duration = (time.time() - step4_start) * 1000
             logger.info(
                 f"Reasoning: agent={reasoning.routing.agent}, "
                 f"urgency={reasoning.routing.urgency}, "
@@ -257,6 +297,7 @@ class Orchestrator:
             if reasoning.response_guidance.plan:
                 logger.info(f"Agent Plan: {reasoning.response_guidance.plan}")
             logger.info("=" * 80)
+            logger.info(f"Step 4 completed in {step4_duration:.2f}ms")
 
             # Step 5: Handle conversation restart if detected
             if reasoning.understanding.is_conversation_restart:
@@ -295,6 +336,11 @@ class Orchestrator:
                 )
 
             # Step 7: Agent transition hook
+            step7_start = time.time()
+            logger.info("-" * 100)
+            logger.info("ORCHESTRATOR STEP 7-8: Agent Activation & Execution")
+            logger.info("-" * 100)
+            logger.info(f"Selected Agent: {agent_name}")
             agent = self.agents.get(agent_name)
             if not agent:
                 logger.error(f"Agent not found: {agent_name}")
@@ -303,6 +349,8 @@ class Orchestrator:
             else:
                 
                 # Call agent activation hook (for state setup)
+                activation_start = time.time()
+                logger.info(f"Activating agent: {agent_name}")
                 with obs_logger.pipeline_step(7, "agent_activation", "agent", {"agent_name": agent_name}) if obs_logger else nullcontext():
                     if hasattr(agent, 'on_activated'):
                         await agent.on_activated(session_id, reasoning)
@@ -310,31 +358,57 @@ class Orchestrator:
                     # Pass minimal context to agent
                     if hasattr(agent, 'set_context'):
                         agent.set_context(session_id, reasoning.response_guidance.minimal_context)
+                activation_duration = (time.time() - activation_start) * 1000
+                logger.info(f"Agent activation completed in {activation_duration:.2f}ms")
 
                 # Execute agent with logging - PASS execution_log
+                execution_start = time.time()
+                logger.info(f"Executing agent: {agent_name} with message: {english_message[:200]}...")
                 with obs_logger.pipeline_step(8, "agent_execution", "agent", {"agent_name": agent_name, "message": english_message[:100]}) if obs_logger else nullcontext():
                     english_response, execution_log = await agent.process_message_with_log(
                         session_id,
                         english_message,
                         execution_log  # Pass log to agent (agent will append tools)
                     )
-                    
-                    # Monitor execution log size after agent execution
-                    tool_count = len(execution_log.tools_used)
-                    if tool_count > 100:
-                        logger.warning(
-                            f"Execution log for session {session_id} has {tool_count} tools. "
-                            f"Consider investigating potential loops or excessive tool calls."
-                        )
-                    elif tool_count > 50:
-                        logger.info(
-                            f"Execution log for session {session_id} has {tool_count} tools "
-                            f"(monitoring for potential issues)"
-                        )
+                execution_duration = (time.time() - execution_start) * 1000
+                logger.info(f"Agent execution completed in {execution_duration:.2f}ms")
+                logger.info(f"Agent response preview: {english_response[:200]}...")
+                logger.info(f"Tools used: {len(execution_log.tools_used)}")
+                
+                # Log token usage if available from observability
+                if obs_logger and hasattr(obs_logger, 'agent_execution') and obs_logger.agent_execution:
+                    agent_exec = obs_logger.agent_execution
+                    if agent_exec.total_tokens:
+                        logger.info(f"Token usage - Input: {agent_exec.total_tokens.input_tokens}, Output: {agent_exec.total_tokens.output_tokens}, Total: {agent_exec.total_tokens.total_tokens}")
+                    if agent_exec.total_cost:
+                        logger.info(f"Cost: ${agent_exec.total_cost.total_cost:.4f}")
+                
+                # Monitor execution log size after agent execution
+                tool_count = len(execution_log.tools_used)
+                if tool_count > 100:
+                    logger.warning(
+                        f"Execution log for session {session_id} has {tool_count} tools. "
+                        f"Consider investigating potential loops or excessive tool calls."
+                    )
+                elif tool_count > 50:
+                    logger.info(
+                        f"Execution log for session {session_id} has {tool_count} tools "
+                        f"(monitoring for potential issues)"
+                    )
+            
+            step7_duration = (time.time() - step7_start) * 1000
+            logger.info(f"Steps 7-8 completed in {step7_duration:.2f}ms")
 
             # Step 8: Validate response (CLOSED-LOOP) - ONLY IF ENABLED
+            step9_start = time.time()
+            logger.info("-" * 100)
+            logger.info("ORCHESTRATOR STEP 9: Validation")
+            logger.info("-" * 100)
 
             if config_settings.enable_validation:
+                logger.info(f"Validation enabled - validating response from {agent_name}")
+                logger.info(f"Response preview: {english_response[:200]}...")
+                logger.info(f"Tools used: {len(execution_log.tools_used)}")
                 with obs_logger.pipeline_step(9, "validation", "reasoning_engine", {"response_preview": english_response[:100]}) if obs_logger else nullcontext():
                     validation = await self.reasoning_engine.validate_response(
                         session_id=session_id,
@@ -356,6 +430,9 @@ class Orchestrator:
                 logger.info(f"Validation result: valid={validation.is_valid}, "
                            f"decision={validation.decision}, "
                            f"confidence={validation.confidence}")
+                if not validation.is_valid:
+                    logger.info(f"Validation issues: {validation.issues}")
+                    logger.info(f"Validation feedback: {validation.feedback_to_agent}")
             else:
                 # Validation disabled - create a pass-through validation result
                 logger.info("Validation layer DISABLED - skipping validation")
@@ -366,18 +443,25 @@ class Orchestrator:
                     issues=[],
                     reasoning=["Validation layer disabled in config"]
                 )
+            step9_duration = (time.time() - step9_start) * 1000
+            logger.info(f"Step 9 completed in {step9_duration:.2f}ms")
 
             # Step 9: Handle validation result (retry loop) - ONLY IF VALIDATION ENABLED
+            step10_start = time.time()
+            logger.info("-" * 100)
+            logger.info("ORCHESTRATOR STEP 10: Validation Retry Loop")
+            logger.info("-" * 100)
 
             max_retries = config_settings.validation_max_retries if config_settings.enable_validation else 0
             retry_count = 0
+            logger.info(f"Max retries allowed: {max_retries}")
 
             while not validation.is_valid and retry_count < max_retries and config_settings.enable_validation:
                 if validation.decision == "retry":
                     # Store tool count before retry for validation
                     tools_before_retry = len(execution_log.tools_used)
                     logger.info(
-                        f"Retrying with feedback (current tools: {tools_before_retry}): "
+                        f"RETRY {retry_count + 1}/{max_retries}: Retrying with feedback (current tools: {tools_before_retry}): "
                         f"{validation.feedback_to_agent}"
                     )
                     logger.debug(f"Execution log before retry: {len(execution_log.tools_used)} tools")
@@ -406,13 +490,17 @@ class Orchestrator:
                         )
 
                         # Re-validate with accumulated execution_log
+                        retry_validation_start = time.time()
                         validation = await self.reasoning_engine.validate_response(
                             session_id,
                             reasoning,
                             english_response,
                             execution_log  # Contains tools from ALL attempts
                         )
+                        retry_validation_duration = (time.time() - retry_validation_start) * 1000
                         retry_count += 1
+                        logger.info(f"Retry {retry_count} validation completed in {retry_validation_duration:.2f}ms")
+                        logger.info(f"Validation result after retry: valid={validation.is_valid}, decision={validation.decision}")
                         
                         if obs_logger:
                             obs_logger._validation_details.retry_count = retry_count
@@ -423,9 +511,19 @@ class Orchestrator:
                     break
                 else:
                     break
+            
+            step10_duration = (time.time() - step10_start) * 1000
+            logger.info(f"Step 10 completed in {step10_duration:.2f}ms (retries: {retry_count})")
 
             # LAYER 2: Finalization (final quality check) - ONLY IF ENABLED
+            step11_start = time.time()
+            logger.info("-" * 100)
+            logger.info("ORCHESTRATOR STEP 11: Finalization")
+            logger.info("-" * 100)
+            
             if config_settings.enable_finalization:
+                logger.info(f"Finalization enabled - processing response from {agent_name}")
+                logger.info(f"Response preview: {english_response[:200]}...")
                 with obs_logger.pipeline_step(11, "finalization", "reasoning_engine", {"response_preview": english_response[:100]}) if obs_logger else nullcontext():
                     finalization = await self.reasoning_engine.finalize_response(
                         session_id=session_id,
@@ -451,8 +549,10 @@ class Orchestrator:
 
                 # Use finalized response
                 if finalization.should_use_rewritten():
+                    logger.info(f"Using edited response from finalization layer")
+                    logger.info(f"Original: {english_response[:200]}...")
                     english_response = finalization.rewritten_response
-                    logger.info("Using edited response from finalization layer")
+                    logger.info(f"Rewritten: {english_response[:200]}...")
                 elif finalization.should_fallback():
                     english_response = self._get_validation_fallback(finalization.issues)
                     logger.warning(f"Finalization triggered fallback: {finalization.issues}")
@@ -462,16 +562,31 @@ class Orchestrator:
                 # Finalization disabled - skip
                 logger.info("Finalization layer DISABLED - using agent response as-is")
                 finalization = None
+            
+            step11_duration = (time.time() - step11_start) * 1000
+            logger.info(f"Step 11 completed in {step11_duration:.2f}ms")
 
             # Step 12: Add assistant response to conversation memory
+            step12_start = time.time()
+            logger.info("-" * 100)
+            logger.info("ORCHESTRATOR STEP 12: Add Assistant Response to Memory")
+            logger.info("-" * 100)
             with obs_logger.pipeline_step(12, "add_assistant_to_memory", "memory_manager", {"response_preview": english_response[:100]}) if obs_logger else nullcontext():
                 self.memory_manager.add_assistant_turn(session_id, english_response)
+            step12_duration = (time.time() - step12_start) * 1000
+            logger.info(f"Step 12 completed in {step12_duration:.2f}ms")
 
             # Step 13: Translation (output)
+            step13_start = time.time()
+            logger.info("-" * 100)
+            logger.info("ORCHESTRATOR STEP 13: Translation (Output)")
+            logger.info("-" * 100)
             # Get current language context for translation
             language_context = global_state.language_context
 
             if language_context.current_language != "en":
+                logger.info(f"Translating response from English to {language_context.get_full_language_code()}")
+                logger.info(f"English response: {english_response[:200]}...")
                 with obs_logger.pipeline_step(13, "translation_output", "translation", {"response_preview": english_response[:100]}) if obs_logger else nullcontext():
                     # process_output now uses dialect-aware translation internally
                     translated_response = await translation_agent.process_output(
@@ -479,8 +594,12 @@ class Orchestrator:
                         english_response
                     )
                     logger.info(f"Translated response to {language_context.get_full_language_code()}")
+                    logger.info(f"Translated response: {translated_response[:200]}...")
             else:
                 translated_response = english_response
+                logger.info("No translation needed (target language is English)")
+            step13_duration = (time.time() - step13_start) * 1000
+            logger.info(f"Step 13 completed in {step13_duration:.2f}ms")
 
             # Step 14: Build response
             with obs_logger.pipeline_step(14, "build_response", "orchestrator", {}) if obs_logger else nullcontext():
@@ -517,6 +636,18 @@ class Orchestrator:
 
             logger.info(f"Response generated by {agent_name}")
             
+            # Log final response summary
+            pipeline_duration_ms = (time.time() - pipeline_start_time) * 1000
+            logger.info("=" * 100)
+            logger.info("ORCHESTRATOR: process_message() COMPLETED")
+            logger.info("=" * 100)
+            logger.info(f"Session ID: {session_id}")
+            logger.info(f"Final Response: {translated_response[:200]}...")
+            logger.info(f"Agent Used: {agent_name}")
+            logger.info(f"Total Pipeline Duration: {pipeline_duration_ms:.2f}ms")
+            logger.info(f"Tools Used: {len(execution_log.tools_used)}")
+            logger.info("=" * 100)
+            
             # Optional: Persist execution_log for debugging/auditing (if enabled)
             # Note: This is optional and should not fail the pipeline if it fails
             if getattr(config_settings, 'persist_execution_logs', False):
@@ -541,7 +672,15 @@ class Orchestrator:
             return response
 
         except Exception as e:
+            pipeline_duration_ms = (time.time() - pipeline_start_time) * 1000
             logger.error(f"Error in orchestrator: {e}", exc_info=True)
+            logger.info("=" * 100)
+            logger.info("ORCHESTRATOR: process_message() FAILED")
+            logger.info("=" * 100)
+            logger.info(f"Session ID: {session_id}")
+            logger.info(f"Error: {str(e)}")
+            logger.info(f"Pipeline Duration Before Error: {pipeline_duration_ms:.2f}ms")
+            logger.info("=" * 100)
             
             if obs_logger:
                 obs_logger.record_pipeline_step(

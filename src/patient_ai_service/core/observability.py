@@ -214,6 +214,7 @@ class ObservabilityLogger:
         self._agent_execution: Optional[AgentExecutionDetails] = None
         self._validation_details: Optional[ValidationDetails] = None
         self._finalization_details: Optional[FinalizationDetails] = None
+        self._custom_metrics: List[Dict[str, Any]] = []
         
         self._start_time = time.time()
         self._enabled = settings.enable_observability
@@ -453,6 +454,43 @@ class ObservabilityLogger:
         
         self._finalization_details = finalization
     
+    def record_custom_metric(
+        self,
+        name: str,
+        value: Any,
+        tags: Optional[Dict[str, Any]] = None
+    ):
+        """Record a custom metric."""
+        if not self._enabled:
+            return
+        
+        metric = {
+            "name": name,
+            "value": value,
+            "tags": tags or {},
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        self._custom_metrics.append(metric)
+        
+        # Broadcast to WebSocket clients (fire and forget)
+        if self._broadcaster:
+            try:
+                import asyncio
+                try:
+                    loop = asyncio.get_running_loop()
+                    # Schedule task without awaiting
+                    task = loop.create_task(self._broadcaster.broadcast_custom_metric(metric))
+                    # Add error callback to log any errors
+                    task.add_done_callback(lambda t: logger.error(f"Broadcast task failed: {t.exception()}") if t.exception() else None)
+                except RuntimeError:
+                    # No running loop, create new one
+                    try:
+                        asyncio.run(self._broadcaster.broadcast_custom_metric(metric))
+                    except Exception as run_error:
+                        logger.error(f"Error running broadcast in new event loop: {run_error}", exc_info=True)
+            except Exception as e:
+                logger.debug(f"Error broadcasting custom metric: {e}")
+    
     def get_session_observability(self) -> SessionObservability:
         """Get complete observability data for the session."""
         if not self._enabled:
@@ -481,7 +519,8 @@ class ObservabilityLogger:
                 "output_cost_usd": total_cost.output_cost_usd,
                 "total_cost_usd": total_cost.total_cost_usd
             },
-            "duration_ms": total_duration_ms
+            "duration_ms": total_duration_ms,
+            "custom_metrics": self._custom_metrics
         }
         
         return SessionObservability(
@@ -546,52 +585,110 @@ class ObservabilityLogger:
             logger.info(f"OBSERVABILITY JSON:\n{json_str}")
     
     def _log_structured(self, observability: SessionObservability):
-        """Log in structured format."""
+        """Log in structured format with per-request summaries and accumulated totals."""
         logger.info("=" * 80)
         logger.info(f"OBSERVABILITY SUMMARY - Session: {observability.session_id}")
+        logger.info("=" * 80)
+        
+        # INDIVIDUAL REQUEST SUMMARIES
+        logger.info("\n📋 INDIVIDUAL REQUEST SUMMARIES:")
+        logger.info("-" * 80)
+        
+        # 1. Reasoning Request
+        if observability.reasoning and observability.reasoning.llm_call:
+            llm_call = observability.reasoning.llm_call
+            logger.info(f"\n1. REASONING REQUEST:")
+            logger.info(f"   Component: {llm_call.component}")
+            logger.info(f"   Model: {llm_call.model}")
+            logger.info(f"   Tokens: {llm_call.tokens.total_tokens} "
+                       f"(Input: {llm_call.tokens.input_tokens}, "
+                       f"Output: {llm_call.tokens.output_tokens})")
+            logger.info(f"   Duration: {llm_call.duration_ms:.2f}ms")
+            if settings.cost_tracking_enabled:
+                logger.info(f"   Cost: ${llm_call.cost.total_cost_usd:.6f}")
+            logger.info(f"   Reasoning Steps: {len(observability.reasoning.reasoning_chain)}")
+        
+        # 2. Agent LLM Calls (individual requests)
+        if observability.agent and observability.agent.llm_calls:
+            logger.info(f"\n2. AGENT LLM CALLS ({len(observability.agent.llm_calls)} requests):")
+            for idx, llm_call in enumerate(observability.agent.llm_calls, 1):
+                logger.info(f"   {idx}. {llm_call.component} - {llm_call.model}")
+                logger.info(f"      Tokens: {llm_call.tokens.total_tokens} "
+                           f"(Input: {llm_call.tokens.input_tokens}, "
+                           f"Output: {llm_call.tokens.output_tokens})")
+                logger.info(f"      Duration: {llm_call.duration_ms:.2f}ms")
+                if settings.cost_tracking_enabled:
+                    logger.info(f"      Cost: ${llm_call.cost.total_cost_usd:.6f}")
+        
+        # 3. Agent Tool Executions (individual requests)
+        if observability.agent and observability.agent.tool_executions:
+            logger.info(f"\n3. AGENT TOOL EXECUTIONS ({len(observability.agent.tool_executions)} requests):")
+            for idx, tool in enumerate(observability.agent.tool_executions, 1):
+                logger.info(f"   {idx}. {tool.tool_name}")
+                logger.info(f"      Duration: {tool.duration_ms:.2f}ms")
+                logger.info(f"      Status: {'✓ Success' if tool.success else '✗ Failed'}")
+                if tool.error:
+                    logger.info(f"      Error: {tool.error}")
+        
+        # 4. Validation Request
+        if observability.validation:
+            logger.info(f"\n4. VALIDATION REQUEST:")
+            logger.info(f"   Decision: {observability.validation.decision}")
+            logger.info(f"   Confidence: {observability.validation.confidence:.2f}")
+            logger.info(f"   Retries: {observability.validation.retry_count}")
+            if observability.validation.llm_call:
+                llm_call = observability.validation.llm_call
+                logger.info(f"   Model: {llm_call.model}")
+                logger.info(f"   Tokens: {llm_call.tokens.total_tokens}")
+                logger.info(f"   Duration: {llm_call.duration_ms:.2f}ms")
+                if settings.cost_tracking_enabled:
+                    logger.info(f"   Cost: ${llm_call.cost.total_cost_usd:.6f}")
+        
+        # 5. Finalization Request
+        if observability.finalization:
+            logger.info(f"\n5. FINALIZATION REQUEST:")
+            logger.info(f"   Decision: {observability.finalization.decision}")
+            logger.info(f"   Confidence: {observability.finalization.confidence:.2f}")
+            logger.info(f"   Rewritten: {observability.finalization.was_rewritten}")
+            if observability.finalization.llm_call:
+                llm_call = observability.finalization.llm_call
+                logger.info(f"   Model: {llm_call.model}")
+                logger.info(f"   Tokens: {llm_call.tokens.total_tokens}")
+                logger.info(f"   Duration: {llm_call.duration_ms:.2f}ms")
+                if settings.cost_tracking_enabled:
+                    logger.info(f"   Cost: ${llm_call.cost.total_cost_usd:.6f}")
+        
+        # ACCUMULATED TOTALS
+        logger.info("\n" + "=" * 80)
+        logger.info("💰 ACCUMULATED TOTALS:")
         logger.info("=" * 80)
         
         # Pipeline summary
         logger.info(f"Pipeline Steps: {len(observability.pipeline.get('steps', []))}")
         logger.info(f"Total Duration: {observability.total_duration_ms:.2f}ms")
         
-        # Token usage
+        # Token usage totals
         logger.info(f"Total Tokens: {observability.total_tokens.total_tokens} "
                    f"(Input: {observability.total_tokens.input_tokens}, "
                    f"Output: {observability.total_tokens.output_tokens})")
         
-        # Cost
+        # Cost totals
         if settings.cost_tracking_enabled:
             logger.info(f"Total Cost: ${observability.total_cost.total_cost_usd:.6f}")
+            logger.info(f"  - Input Cost: ${observability.total_cost.input_cost_usd:.6f}")
+            logger.info(f"  - Output Cost: ${observability.total_cost.output_cost_usd:.6f}")
+            logger.info(f"  - Model: {observability.total_cost.model}")
+            logger.info(f"  - Provider: {observability.total_cost.provider}")
         
-        # Reasoning
-        if observability.reasoning:
-            logger.info(f"Reasoning Chain: {len(observability.reasoning.reasoning_chain)} steps")
-            if observability.reasoning.llm_call:
-                logger.info(f"Reasoning Tokens: {observability.reasoning.llm_call.tokens.total_tokens}")
-                if settings.cost_tracking_enabled:
-                    logger.info(f"Reasoning Cost: ${observability.reasoning.llm_call.cost.total_cost_usd:.6f}")
-        
-        # Agent
+        # Agent summary
         if observability.agent:
-            logger.info(f"Agent: {observability.agent.agent_name}")
-            logger.info(f"Agent LLM Calls: {len(observability.agent.llm_calls)}")
-            logger.info(f"Agent Tool Executions: {len(observability.agent.tool_executions)}")
-            logger.info(f"Agent Tokens: {observability.agent.total_tokens.total_tokens}")
+            logger.info(f"\nAgent Summary:")
+            logger.info(f"  Agent: {observability.agent.agent_name}")
+            logger.info(f"  LLM Calls: {len(observability.agent.llm_calls)}")
+            logger.info(f"  Tool Executions: {len(observability.agent.tool_executions)}")
+            logger.info(f"  Agent Tokens: {observability.agent.total_tokens.total_tokens}")
             if settings.cost_tracking_enabled:
-                logger.info(f"Agent Cost: ${observability.agent.total_cost.total_cost_usd:.6f}")
-        
-        # Validation
-        if observability.validation:
-            logger.info(f"Validation: {observability.validation.decision} "
-                       f"(confidence: {observability.validation.confidence:.2f}, "
-                       f"retries: {observability.validation.retry_count})")
-        
-        # Finalization
-        if observability.finalization:
-            logger.info(f"Finalization: {observability.finalization.decision} "
-                       f"(confidence: {observability.finalization.confidence:.2f}, "
-                       f"rewritten: {observability.finalization.was_rewritten})")
+                logger.info(f"  Agent Cost: ${observability.agent.total_cost.total_cost_usd:.6f}")
         
         logger.info("=" * 80)
     

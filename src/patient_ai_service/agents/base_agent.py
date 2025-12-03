@@ -14,6 +14,8 @@ import time
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Any, Callable, Tuple
 from datetime import datetime
+from dataclasses import dataclass, field
+from enum import Enum
 
 from patient_ai_service.core import get_llm_client, get_state_manager
 from patient_ai_service.core.llm import LLMClient
@@ -32,6 +34,79 @@ from patient_ai_service.models.observability import (
 
 logger = logging.getLogger(__name__)
 
+# Tool iteration configuration
+DEFAULT_MAX_TOOL_ITERATIONS = 10
+MAX_TOOL_ITERATIONS_HARD_LIMIT = 25  # Safety ceiling
+
+
+class CircuitState(Enum):
+    """Circuit breaker state."""
+    CLOSED = "closed"      # Normal operation
+    OPEN = "open"          # Failing, reject requests
+    HALF_OPEN = "half_open"  # Testing if service recovered
+
+
+@dataclass
+class CircuitBreaker:
+    """
+    Circuit breaker to prevent cascading failures.
+
+    States:
+    - CLOSED: Normal operation, requests pass through
+    - OPEN: Too many failures, reject requests immediately
+    - HALF_OPEN: Allow one test request to check recovery
+    """
+    failure_threshold: int = 3          # Failures before opening
+    recovery_timeout: float = 30.0      # Seconds before trying again
+
+    _failure_count: int = field(default=0, init=False)
+    _last_failure_time: Optional[float] = field(default=None, init=False)
+    _state: CircuitState = field(default=CircuitState.CLOSED, init=False)
+
+    def record_success(self) -> None:
+        """Record a successful operation."""
+        self._failure_count = 0
+        self._state = CircuitState.CLOSED
+
+    def record_failure(self) -> None:
+        """Record a failed operation."""
+        self._failure_count += 1
+        self._last_failure_time = time.time()
+
+        if self._failure_count >= self.failure_threshold:
+            self._state = CircuitState.OPEN
+            logger.warning(
+                f"Circuit breaker OPENED after {self._failure_count} failures"
+            )
+
+    def can_execute(self) -> bool:
+        """Check if operation should be attempted."""
+        if self._state == CircuitState.CLOSED:
+            return True
+
+        if self._state == CircuitState.OPEN:
+            # Check if recovery timeout has passed
+            if self._last_failure_time:
+                elapsed = time.time() - self._last_failure_time
+                if elapsed >= self.recovery_timeout:
+                    self._state = CircuitState.HALF_OPEN
+                    logger.info("Circuit breaker entering HALF_OPEN state")
+                    return True
+            return False
+
+        # HALF_OPEN: allow one test request
+        return True
+
+    def get_state(self) -> CircuitState:
+        """Get current circuit state."""
+        return self._state
+
+    def reset(self) -> None:
+        """Reset circuit breaker to initial state."""
+        self._failure_count = 0
+        self._last_failure_time = None
+        self._state = CircuitState.CLOSED
+
 
 class BaseAgent(ABC):
     """
@@ -48,11 +123,19 @@ class BaseAgent(ABC):
         self,
         agent_name: str,
         llm_client: Optional[LLMClient] = None,
-        state_manager: Optional[StateManager] = None
+        state_manager: Optional[StateManager] = None,
+        max_tool_iterations: int = DEFAULT_MAX_TOOL_ITERATIONS
     ):
         self.agent_name = agent_name
         self.llm_client = llm_client or get_llm_client()
         self.state_manager = state_manager or get_state_manager()
+
+        # Validate and store max iterations
+        self.max_tool_iterations = min(
+            max_tool_iterations,
+            MAX_TOOL_ITERATIONS_HARD_LIMIT
+        )
+        logger.info(f"Agent {agent_name} initialized with max_tool_iterations={self.max_tool_iterations}")
 
         # Conversation history per session
         self.conversation_history: Dict[str, List[Dict[str, str]]] = {}
@@ -64,6 +147,12 @@ class BaseAgent(ABC):
         # Note: Execution log is now passed from orchestrator, not created here
         # This dict is only used temporarily to pass log to _execute_tool()
         self._execution_log: Dict[str, ExecutionLog] = {}
+
+        # Tool execution state tracking (PHASE 2)
+        self._tool_execution_state: Dict[str, Dict[str, Any]] = {}
+
+        # Circuit breakers per session (PHASE 3)
+        self._circuit_breakers: Dict[str, CircuitBreaker] = {}
 
         # Tool registry
         self._tools: Dict[str, Callable] = {}
@@ -558,220 +647,161 @@ class BaseAgent(ABC):
                 if llm_call:
                     llm_calls.append(llm_call)
 
-            # Handle tool calls
-            if tool_use:
-                logger.info(f"Tool call requested: {tool_use.get('name')}")
+            # Handle tool calls in a loop (supports multiple iterations)
+            iteration = 0
+            current_tool_use = tool_use
+            assistant_message = response_text
 
-                # Add assistant response to history
-                # Only add if there's actual text - don't add "Using tool: X" messages
-                # System prompts handle preventing premature responses, so we trust the LLM output
-                if response_text and response_text.strip() and not response_text.startswith("Using tool:"):
-                    self.conversation_history[session_id].append({
-                        "role": "assistant",
-                        "content": response_text
-                    })
-                # If no response_text, don't add anything - the tool result will be added next
+            while current_tool_use and iteration < self.max_tool_iterations:
+                iteration += 1
+                logger.info(f"Tool iteration {iteration}/{self.max_tool_iterations}: {current_tool_use.get('name')}")
 
-                # Execute tool
+                # Check circuit breaker
+                circuit_breaker = self._get_circuit_breaker(session_id)
+                if not circuit_breaker.can_execute():
+                    logger.warning(f"Circuit breaker OPEN for session {session_id}, stopping tool execution")
+                    assistant_message = (
+                        "I'm experiencing technical difficulties right now. "
+                        "Please try again in a moment, or contact support if this persists."
+                    )
+                    break
+
+                # Execute the tool
                 tool_result = await self._execute_tool(
                     session_id=session_id,
-                    tool_name=tool_use.get('name'),
-                    tool_input=tool_use.get('input', {})
+                    tool_name=current_tool_use.get('name'),
+                    tool_input=current_tool_use.get('input', {})
                 )
+
+                # Record circuit breaker result
+                if tool_result.get("success") == False or "error" in tool_result:
+                    circuit_breaker.record_failure()
+                else:
+                    circuit_breaker.record_success()
 
                 # Add tool result to history
-                tool_result_message = {
+                self.conversation_history[session_id].append({
                     "role": "user",
                     "content": f"Tool result: {json.dumps(tool_result)}"
-                }
-                self.conversation_history[session_id].append(tool_result_message)
+                })
 
-                # ========== AUTO-BOOKING ENFORCEMENT ==========
-                # Check if automatic booking should be triggered
-                logger.info(f"🔍 AUTO-BOOKING CHECK: tool_name='{tool_use.get('name')}', checking if auto-booking should trigger...")
+                # Check for auto-booking enforcement
                 auto_booking_params = self._should_auto_book_appointment(
                     session_id=session_id,
-                    tool_name=tool_use.get('name'),
+                    tool_name=current_tool_use.get('name'),
                     tool_result=tool_result
                 )
-                logger.info(f"🔍 AUTO-BOOKING RESULT: {auto_booking_params is not None} (params: {auto_booking_params})")
 
                 if auto_booking_params:
-                    # Automatically execute book_appointment without waiting for LLM
                     logger.info("🤖 ENFORCING AUTOMATIC BOOKING (LLM override)")
-                    
-                    # Force the next tool call to be book_appointment
-                    next_tool_use = {
+                    current_tool_use = {
                         "name": "book_appointment",
                         "input": auto_booking_params
                     }
-                    
-                    # Skip LLM call for next tool decision
-                    final_response = ""
-                else:
-                    # Normal flow: Ask LLM if another tool call is needed
-                    llm_start_time = time.time()
-                    if self._tool_schemas:
-                        if hasattr(self.llm_client, 'create_message_with_tools_and_usage'):
-                            final_response, next_tool_use, tokens = self.llm_client.create_message_with_tools_and_usage(
-                                system=system_prompt,
-                                messages=self.conversation_history[session_id],
-                                tools=self._tool_schemas
-                            )
-                        else:
-                            final_response, next_tool_use = self.llm_client.create_message_with_tools(
-                                system=system_prompt,
-                                messages=self.conversation_history[session_id],
-                                tools=self._tool_schemas
-                            )
-                            tokens = TokenUsage()
-                    else:
-                        if hasattr(self.llm_client, 'create_message_with_usage'):
-                            final_response, tokens = self.llm_client.create_message_with_usage(
-                                system=system_prompt,
-                                messages=self.conversation_history[session_id]
-                            )
-                            next_tool_use = None
-                        else:
-                            final_response = self.llm_client.create_message(
-                                system=system_prompt,
-                                messages=self.conversation_history[session_id]
-                            )
-                            tokens = TokenUsage()
-                            next_tool_use = None
-                    
-                    llm_duration_ms = (time.time() - llm_start_time) * 1000
-                    if obs_logger:
-                        llm_call = obs_logger.record_llm_call(
-                            component="agent",
-                            provider=settings.llm_provider.value,
-                            model=settings.get_llm_model(),
-                            tokens=tokens,
-                            duration_ms=llm_duration_ms,
-                            system_prompt_length=len(system_prompt),
-                            messages_count=len(self.conversation_history[session_id]),
-                            temperature=settings.llm_temperature,
-                            max_tokens=settings.llm_max_tokens
-                        )
-                        if llm_call:
-                            llm_calls.append(llm_call)
-                # ========== END AUTO-BOOKING ENFORCEMENT ==========
+                    continue  # Skip LLM call, execute booking immediately
 
-                # If another tool is needed, execute it (chained tool call)
-                if next_tool_use:
-                    logger.info(f"Chained tool call requested: {next_tool_use.get('name')}")
-                    
-                    # Don't add intermediate responses that contain tool results - they're for internal use only
-                    # Only add natural language responses that don't expose tool internals
-                    # System prompts handle preventing premature responses, so we trust the LLM output
-                    if final_response and final_response.strip() and not final_response.startswith("Using tool") and "Tool result:" not in final_response:
-                        self.conversation_history[session_id].append({
-                            "role": "assistant",
-                            "content": final_response
-                        })
-                    
-                    # Execute next tool
-                    next_tool_result = await self._execute_tool(
-                        session_id=session_id,
-                        tool_name=next_tool_use.get('name'),
-                        tool_input=next_tool_use.get('input', {})
+                # Ask LLM if another tool call is needed
+                llm_start_time = time.time()
+                if hasattr(self.llm_client, 'create_message_with_tools_and_usage'):
+                    next_response, next_tool_use, tokens = self.llm_client.create_message_with_tools_and_usage(
+                        system=system_prompt,
+                        messages=self.conversation_history[session_id],
+                        tools=self._tool_schemas
                     )
-                    
-                    # Add next tool result
-                    next_tool_result_message = {
-                        "role": "user",
-                        "content": f"Tool result: {json.dumps(next_tool_result)}"
-                    }
-                    self.conversation_history[session_id].append(next_tool_result_message)
-                    
-                    # ========== AUTO-BOOKING ENFORCEMENT (for chained tool calls) ==========
-                    # Check if automatic booking should be triggered after chained tool call
-                    logger.info(f"🔍 AUTO-BOOKING CHECK (chained): tool_name='{next_tool_use.get('name')}', checking if auto-booking should trigger...")
-                    auto_booking_params_chained = self._should_auto_book_appointment(
-                        session_id=session_id,
-                        tool_name=next_tool_use.get('name'),
-                        tool_result=next_tool_result
-                    )
-                    logger.info(f"🔍 AUTO-BOOKING RESULT (chained): {auto_booking_params_chained is not None} (params: {auto_booking_params_chained})")
-                    
-                    if auto_booking_params_chained:
-                        # Automatically execute book_appointment without waiting for LLM
-                        logger.info("🤖 ENFORCING AUTOMATIC BOOKING (LLM override) - chained tool call")
-                        book_appointment_result = await self._execute_tool(
-                            session_id=session_id,
-                            tool_name="book_appointment",
-                            tool_input=auto_booking_params_chained
-                        )
-                        # Add auto-booking tool result to history
-                        self.conversation_history[session_id].append({
-                            "role": "user",
-                            "content": f"Tool result: {json.dumps(book_appointment_result)}"
-                        })
-                        # Force LLM to generate a final confirmation message after auto-booking
-                        clean_messages = [
-                            msg for msg in self.conversation_history[session_id]
-                            if not msg.get("content", "").startswith("Tool result:")
-                        ]
-                        assistant_message = self.llm_client.create_message(
-                            system=system_prompt + "\n\nCRITICAL: Provide ONLY a natural language confirmation response for the appointment. Do NOT include tool results, JSON, or technical details. Just provide a friendly confirmation message.",
-                            messages=clean_messages
-                        )
-                        # Skip further processing as booking is complete
-                        return assistant_message
-                    # ========== END AUTO-BOOKING ENFORCEMENT (chained) ==========
-                    
-                    # Get final response after all tools
-                    # Filter out tool result messages from conversation history for final response
-                    clean_messages = [
-                        msg for msg in self.conversation_history[session_id]
-                        if not msg.get("content", "").startswith("Tool result:")
-                    ]
-                    
-                    llm_start_time = time.time()
-                    if hasattr(self.llm_client, 'create_message_with_usage'):
-                        assistant_message, tokens = self.llm_client.create_message_with_usage(
-                            system=system_prompt + "\n\nCRITICAL: Provide ONLY a natural language response. Do NOT include tool results, JSON, or technical details. Just provide a friendly confirmation message.",
-                            messages=clean_messages
-                        )
-                    else:
-                        assistant_message = self.llm_client.create_message(
-                            system=system_prompt + "\n\nCRITICAL: Provide ONLY a natural language response. Do NOT include tool results, JSON, or technical details. Just provide a friendly confirmation message.",
-                            messages=clean_messages
-                        )
-                        tokens = TokenUsage()
-                    
-                    llm_duration_ms = (time.time() - llm_start_time) * 1000
-                    if obs_logger:
-                        llm_call = obs_logger.record_llm_call(
-                            component="agent",
-                            provider=settings.llm_provider.value,
-                            model=settings.get_llm_model(),
-                            tokens=tokens,
-                            duration_ms=llm_duration_ms,
-                            system_prompt_length=len(system_prompt),
-                            messages_count=len(clean_messages),
-                            temperature=settings.llm_temperature,
-                            max_tokens=settings.llm_max_tokens
-                        )
-                        if llm_call:
-                            llm_calls.append(llm_call)
-                    
-                    # Clean up any tool result JSON that might have leaked into the response
-                    if "Tool result:" in assistant_message:
-                        # Extract only the natural language part before "Tool result:"
-                        parts = assistant_message.split("Tool result:")
-                        if parts:
-                            assistant_message = parts[0].strip()
-                            # If there's no natural language, get a clean response
-                            if not assistant_message:
-                                assistant_message = self.llm_client.create_message(
-                                    system=system_prompt + "\n\nIMPORTANT: Provide ONLY a natural language response. Do NOT include tool results, JSON, or technical details in your response. Just provide a friendly confirmation message.",
-                                    messages=clean_messages
-                                )
                 else:
-                    assistant_message = final_response
-            else:
-                assistant_message = response_text
+                    next_response, next_tool_use = self.llm_client.create_message_with_tools(
+                        system=system_prompt,
+                        messages=self.conversation_history[session_id],
+                        tools=self._tool_schemas
+                    )
+                    tokens = TokenUsage()
+
+                llm_duration_ms = (time.time() - llm_start_time) * 1000
+                if obs_logger:
+                    llm_call = obs_logger.record_llm_call(
+                        component="agent",
+                        provider=settings.llm_provider.value,
+                        model=settings.get_llm_model(),
+                        tokens=tokens,
+                        duration_ms=llm_duration_ms,
+                        system_prompt_length=len(system_prompt),
+                        messages_count=len(self.conversation_history[session_id]),
+                        temperature=settings.llm_temperature,
+                        max_tokens=settings.llm_max_tokens
+                    )
+                    if llm_call:
+                        llm_calls.append(llm_call)
+
+                # Update for next iteration
+                current_tool_use = next_tool_use
+                assistant_message = next_response
+
+            # Log if we hit the iteration limit
+            if iteration >= self.max_tool_iterations:
+                logger.warning(
+                    f"Hit max tool iterations ({self.max_tool_iterations}) for session {session_id}. "
+                    f"Task may be incomplete."
+                )
+
+            # PHASE 5: Log observability metrics
+            if obs_logger and iteration > 0:
+                # Log tool iterations
+                obs_logger.record_custom_metric(
+                    name="tool_iterations",
+                    value=iteration,
+                    tags={
+                        "agent": self.agent_name,
+                        "session_id": session_id,
+                        "hit_limit": iteration >= self.max_tool_iterations
+                    }
+                )
+
+                # Log circuit breaker state
+                circuit_state = self._get_circuit_breaker(session_id).get_state()
+                obs_logger.record_custom_metric(
+                    name="circuit_breaker_state",
+                    value=circuit_state.value,
+                    tags={
+                        "agent": self.agent_name,
+                        "session_id": session_id
+                    }
+                )
+
+            # Generate final response (cleaned of tool results)
+            if tool_use:  # Only if tools were actually used
+                clean_messages = [
+                    msg for msg in self.conversation_history[session_id]
+                    if not msg.get("content", "").startswith("Tool result:")
+                ]
+
+                llm_start_time = time.time()
+                if hasattr(self.llm_client, 'create_message_with_usage'):
+                    assistant_message, tokens = self.llm_client.create_message_with_usage(
+                        system=system_prompt + "\n\nCRITICAL: Provide ONLY a natural language response. Do NOT include tool results, JSON, or technical details. Just provide a friendly confirmation message.",
+                        messages=clean_messages
+                    )
+                else:
+                    assistant_message = self.llm_client.create_message(
+                        system=system_prompt + "\n\nCRITICAL: Provide ONLY a natural language response. Do NOT include tool results, JSON, or technical details. Just provide a friendly confirmation message.",
+                        messages=clean_messages
+                    )
+                    tokens = TokenUsage()
+
+                llm_duration_ms = (time.time() - llm_start_time) * 1000
+                if obs_logger:
+                    llm_call = obs_logger.record_llm_call(
+                        component="agent",
+                        provider=settings.llm_provider.value,
+                        model=settings.get_llm_model(),
+                        tokens=tokens,
+                        duration_ms=llm_duration_ms,
+                        system_prompt_length=len(system_prompt),
+                        messages_count=len(clean_messages),
+                        temperature=settings.llm_temperature,
+                        max_tokens=settings.llm_max_tokens
+                    )
+                    if llm_call:
+                        llm_calls.append(llm_call)
 
             # Add assistant response to history
             self.conversation_history[session_id].append({
@@ -937,6 +967,62 @@ class BaseAgent(ABC):
                 logger.warning(f"⚠️ No execution_log found for session {session_id} - failed tool {tool_name} not logged!")
 
             return error_result
+
+    def _start_tool_execution(self, session_id: str) -> None:
+        """
+        Mark that tool execution has started for this session.
+
+        Args:
+            session_id: Session identifier
+        """
+        self._tool_execution_state[session_id] = {
+            "started_at": time.time(),
+            "tools_called": [],
+            "completed": False
+        }
+
+    def _end_tool_execution(self, session_id: str, success: bool) -> None:
+        """
+        Mark that tool execution has completed.
+
+        Args:
+            session_id: Session identifier
+            success: Whether tool execution was successful
+        """
+        if session_id in self._tool_execution_state:
+            self._tool_execution_state[session_id]["completed"] = True
+            self._tool_execution_state[session_id]["success"] = success
+            self._tool_execution_state[session_id]["ended_at"] = time.time()
+
+    def _is_tool_execution_complete(self, session_id: str) -> bool:
+        """
+        Check if tool execution is complete for this session.
+
+        Args:
+            session_id: Session identifier
+
+        Returns:
+            True if tool execution is complete, False otherwise
+        """
+        state = self._tool_execution_state.get(session_id, {})
+        return state.get("completed", True)  # Default True if no state
+
+    def _get_circuit_breaker(self, session_id: str) -> CircuitBreaker:
+        """
+        Get or create circuit breaker for session.
+
+        Args:
+            session_id: Session identifier
+
+        Returns:
+            CircuitBreaker instance for the session
+        """
+        if session_id not in self._circuit_breakers:
+            self._circuit_breakers[session_id] = CircuitBreaker(
+                failure_threshold=3,
+                recovery_timeout=30.0
+            )
+        return self._circuit_breakers[session_id]
 
     def _get_error_response(self, error: str) -> str:
         """Generate user-friendly error response."""

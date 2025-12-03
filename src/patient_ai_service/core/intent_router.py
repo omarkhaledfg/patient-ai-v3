@@ -9,6 +9,7 @@ from typing import Tuple, Dict, Any
 
 from patient_ai_service.models.enums import IntentType, UrgencyLevel
 from patient_ai_service.models.messages import IntentClassification
+from patient_ai_service.core.config import settings
 from .llm import get_llm_client, LLMClient
 
 logger = logging.getLogger(__name__)
@@ -134,7 +135,7 @@ Provide your classification in JSON format:
         response = self.llm_client.create_message(
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
-            temperature=0.3  # Lower temperature for classification
+            temperature=settings.intent_router_temperature
         )
 
         # Parse response

@@ -23,6 +23,7 @@ from patient_ai_service.core.conversation_memory import (
     ConversationMemoryManager,
     get_conversation_memory_manager
 )
+from patient_ai_service.core.state_manager import get_state_manager
 from patient_ai_service.models.validation import (
     ValidationResult,
     ExecutionLog,
@@ -98,6 +99,7 @@ class ReasoningEngine:
         """
         self.llm_client = llm_client or get_llm_client()
         self.memory_manager = memory_manager or get_conversation_memory_manager()
+        self.state_manager = get_state_manager()
         self.test_mode = test_mode
 
         # For deterministic testing
@@ -208,22 +210,23 @@ class ReasoningEngine:
             
             # Single LLM call does everything
             llm_start_time = time.time()
+            reasoning_temp = settings.reasoning_temperature
             if hasattr(self.llm_client, 'create_message_with_usage'):
                 response, tokens = self.llm_client.create_message_with_usage(
                     system=self._get_system_prompt(),
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=0.3
+                    temperature=reasoning_temp
                 )
             else:
                 response = self.llm_client.create_message(
                     system=self._get_system_prompt(),
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=0.3
+                    temperature=reasoning_temp
                 )
                 tokens = TokenUsage()
-            
+
             llm_duration_ms = (time.time() - llm_start_time) * 1000
-            
+
             # Record LLM call
             if obs_logger:
                 llm_call = obs_logger.record_llm_call(
@@ -234,7 +237,7 @@ class ReasoningEngine:
                     duration_ms=llm_duration_ms,
                     system_prompt_length=len(self._get_system_prompt()),
                     messages_count=1,
-                    temperature=0.3,
+                    temperature=reasoning_temp,
                     max_tokens=settings.llm_max_tokens
                 )
             
@@ -652,18 +655,19 @@ RESPOND WITH VALID JSON ONLY - NO OTHER TEXT."""
             # Call LLM for validation (low temperature for consistency)
             obs_logger = get_observability_logger(session_id) if settings.enable_observability else None
             llm_start_time = time.time()
-            
+
+            validation_temp = settings.validation_temperature
             if hasattr(self.llm_client, 'create_message_with_usage'):
                 response, tokens = self.llm_client.create_message_with_usage(
                     system=self._get_validation_system_prompt(),
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=0.2  # Low temp for deterministic validation
+                    temperature=validation_temp
                 )
             else:
                 response = self.llm_client.create_message(
                     system=self._get_validation_system_prompt(),
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=0.2
+                    temperature=validation_temp
                 )
                 tokens = TokenUsage()
             
@@ -765,11 +769,10 @@ RESPOND WITH VALID JSON ONLY - NO OTHER TEXT."""
             )
 
             # Call LLM for finalization (slightly higher temp for natural edits)
-            from patient_ai_service.core.config import settings
             obs_logger = get_observability_logger(session_id) if settings.enable_observability else None
             llm_start_time = time.time()
-            
-            finalization_temp = getattr(settings, 'finalization_temperature', 0.3)
+
+            finalization_temp = settings.finalization_temperature
             if hasattr(self.llm_client, 'create_message_with_usage'):
                 response, tokens = self.llm_client.create_message_with_usage(
                     system=self._get_finalization_system_prompt(),
