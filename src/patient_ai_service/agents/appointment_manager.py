@@ -32,11 +32,11 @@ class AppointmentManagerAgent(BaseAgent):
     """
 
     def __init__(self, db_client: Optional[DbOpsClient] = None, **kwargs):
-        # Pass max_tool_iterations through kwargs or set explicitly
-        if 'max_tool_iterations' not in kwargs:
-            kwargs['max_tool_iterations'] = 15  # Higher for complex booking flows
+        # Extract max_tool_iterations from kwargs if present (not used by BaseAgent)
+        max_tool_iterations = kwargs.pop('max_tool_iterations', 15)  # Higher for complex booking flows
         super().__init__(agent_name="AppointmentManager", **kwargs)
         self.db_client = db_client or DbOpsClient()
+        self.max_tool_iterations = max_tool_iterations
 
     async def on_activated(self, session_id: str, reasoning: Any):
         """
@@ -123,7 +123,7 @@ class AppointmentManagerAgent(BaseAgent):
         self.register_tool(
             name="check_availability",
             function=self.tool_check_availability,
-            description=f"Check available time ranges for a specific doctor on a date. Returns availability ranges (gaps between booked appointments) for LLM flexibility. Example: If appointments are at 10:00-10:30 and 15:00-15:30, returns ranges like ['9:00-10:00', '10:30-15:00', '15:30-17:00']. IMPORTANT: doctor_id must be a UUID (use list_doctors first to get it), not a doctor name. When parsing 'tomorrow', calculate it dynamically: today is {today_str}, so tomorrow is {tomorrow_str}.",
+            description=f"Check doctor availability with TWO MODES:\n\n1. RANGE MODE (no requested_time): Returns availability_ranges - continuous time blocks where the doctor is available. Example: ['9:00-10:00', '10:30-15:00', '15:30-17:00']. Use these ranges to suggest appointment times naturally.\n\n2. SPECIFIC TIME MODE (with requested_time): Checks if a specific time is available. Returns true/false and alternatives if unavailable. Example: requested_time='14:00' returns available_at_requested_time=true/false plus alternative_slots=['14:30', '15:00', '13:30'] if false.\n\nIMPORTANT: doctor_id must be a UUID (use list_doctors first to get it), not a doctor name. When parsing 'tomorrow', calculate it dynamically: today is {today_str}, so tomorrow is {tomorrow_str}.",
             parameters={
                 "doctor_id": {
                     "type": "string",
@@ -135,7 +135,7 @@ class AppointmentManagerAgent(BaseAgent):
                 },
                 "requested_time": {
                     "type": "string",
-                    "description": "Optional: Specific time to check (e.g., '14:00', '2pm', '2:00 PM'). Convert to 24-hour format."
+                    "description": "Optional: Specific time to check (e.g., '14:00', '2pm', '2:00 PM'). If provided, returns whether that specific time is available plus alternatives if not. If omitted, returns availability ranges."
                 }
             }
         )
@@ -505,7 +505,7 @@ CRITICAL RULES:
 AVAILABLE TOOLS:
 1. list_doctors - Get all doctors with UUIDs and specialties
 2. find_doctor_by_name - Find specific doctor by name (returns UUID)
-3. check_availability - Check if doctor has slot at date/time
+3. check_availability - Returns availability_ranges (e.g., ["9:00-12:00", "14:00-17:00"]). Present these ranges naturally to users as "9:00 AM - 12:00 PM" and "2:00 PM - 5:00 PM"
 4. book_appointment - Create single appointment (requires patient_id, doctor_id, date, time, reason)
 5. book_multiple_appointments - Book multiple appointments at once with different parameters
 6. check_patient_appointments - View patient's existing appointments
@@ -746,6 +746,272 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
 
         return ranges
 
+    def _normalize_time_to_24hr(self, time_str: str) -> Optional[str]:
+        """
+        Normalize various time formats to 24-hour HH:MM format.
+
+        Supports:
+        - "14:00", "14:30" (already normalized)
+        - "2pm", "2PM", "2:00pm", "2:00 PM" (12-hour with AM/PM)
+        - "2am", "2AM", "2:00am", "2:00 AM"
+        - "14", "02" (hour only, assumes :00)
+
+        Args:
+            time_str: Time string in various formats
+
+        Returns:
+            Normalized time in "HH:MM" format, or None if parsing fails
+        """
+        import re
+
+        if not time_str:
+            return None
+
+        # Strip whitespace and convert to lowercase for easier parsing
+        time_str = time_str.strip().lower()
+
+        # Pattern 1: Already in HH:MM or H:MM format (24-hour)
+        match = re.match(r'^(\d{1,2}):(\d{2})$', time_str)
+        if match:
+            hour = int(match.group(1))
+            minute = int(match.group(2))
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                return f"{hour:02d}:{minute:02d}"
+            else:
+                logger.warning(f"Invalid time values: hour={hour}, minute={minute}")
+                return None
+
+        # Pattern 2: 12-hour format with AM/PM (e.g., "2pm", "2:30pm", "2:30 PM")
+        match = re.match(r'^(\d{1,2}):?(\d{2})?\s*(am|pm)$', time_str)
+        if match:
+            hour = int(match.group(1))
+            minute = int(match.group(2)) if match.group(2) else 0
+            period = match.group(3)
+
+            # Validate ranges
+            if not (1 <= hour <= 12 and 0 <= minute <= 59):
+                logger.warning(f"Invalid 12-hour time: hour={hour}, minute={minute}")
+                return None
+
+            # Convert to 24-hour format
+            if period == 'am':
+                if hour == 12:
+                    hour = 0  # 12am is 00:00
+            else:  # pm
+                if hour != 12:
+                    hour += 12  # 1pm-11pm become 13-23, 12pm stays 12
+
+            return f"{hour:02d}:{minute:02d}"
+
+        # Pattern 3: Hour only (e.g., "14", "2") - assume :00
+        match = re.match(r'^(\d{1,2})$', time_str)
+        if match:
+            hour = int(match.group(1))
+            if 0 <= hour <= 23:
+                return f"{hour:02d}:00"
+            else:
+                logger.warning(f"Invalid hour: {hour}")
+                return None
+
+        # Could not parse
+        logger.warning(f"Could not parse time format: '{time_str}'")
+        return None
+
+    def _is_time_in_available_slots(
+        self,
+        requested_time: str,
+        available_slots: List[Dict[str, Any]]
+    ) -> bool:
+        """
+        Check if a specific time is available in the list of time slots.
+
+        Args:
+            requested_time: Time in HH:MM format (normalized)
+            available_slots: List of slot dicts with 'start_time' and 'end_time'
+
+        Returns:
+            True if the requested time matches any slot's start_time
+        """
+        if not available_slots:
+            return False
+
+        # Check each slot
+        for slot in available_slots:
+            start_time = slot.get('start_time', '')
+
+            # Extract HH:MM part (handle "14:00:00" or "14:00" formats)
+            if len(start_time) >= 5:
+                start_time_short = start_time[:5]  # Get first 5 chars (HH:MM)
+
+                if start_time_short == requested_time:
+                    return True
+
+        return False
+
+
+    def _get_alternative_slots(
+        self,
+        session_id: str,
+        doctor_id: str,
+        date: str,
+        requested_time: str,
+        available_timeslots: List[Dict[str, Any]]
+    ) -> str:
+        """
+        Get alternative time slots closest to the requested time when unavailable.
+
+        Ranks available slots by time proximity (absolute difference in minutes).
+
+        Args:
+            session_id: Session identifier
+            doctor_id: Doctor ID
+            date: Requested date
+            requested_time: Requested time (HH:MM format)
+            available_timeslots: Pre-fetched available slots
+
+        Returns:
+            String with up to 4 alternative slots closest to the requested time
+        """
+        try:
+            # Convert time to minutes since midnight for fast comparison
+            def time_to_minutes(time_str: str) -> int:
+                """Convert HH:MM to minutes since midnight"""
+                try:
+                    h, m = time_str[:5].split(':')
+                    return int(h) * 60 + int(m)
+                except (ValueError, IndexError):
+                    return -1  # Invalid time
+
+            requested_minutes = time_to_minutes(requested_time)
+            if requested_minutes == -1:
+                logger.warning(f"Invalid time format '{requested_time}' for session {session_id}")
+                # Fallback: return first 4 slots if time is invalid
+                slots = [slot.get('start_time', '')[:5] for slot in available_timeslots[:4] if slot.get('start_time')]
+                return ", ".join(slots) if slots else "No alternative slots available"
+
+            # Extract valid slots with their time differences
+            valid_slots = []
+            for slot in available_timeslots:
+                start = slot.get('start_time', '')[:5]
+                if start:
+                    minutes = time_to_minutes(start)
+                    if minutes != -1:
+                        valid_slots.append((start, abs(minutes - requested_minutes)))
+
+            if not valid_slots:
+                logger.info(f"No valid slots found for doctor {doctor_id} on {date} (session: {session_id})")
+                return "No alternative slots available"
+
+            # Sort by proximity (time difference) and take top 4
+            closest_slots = sorted(valid_slots, key=lambda x: x[1])[:4]
+
+            # Return just the time strings
+            result = ", ".join(slot[0] for slot in closest_slots)
+            logger.debug(f"Found {len(closest_slots)} alternative slots for session {session_id}: {result}")
+            return result
+        except Exception as e:
+            logger.warning(f"Failed to get alternative slots for session {session_id}: {e}")
+            return "No alternative slots available"
+
+    def _check_specific_time_availability(
+        self,
+        session_id: str,
+        doctor_id: str,
+        date: str,
+        requested_time: str,
+        available_timeslots: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """
+        Check if a specific requested time is available and provide alternatives if not.
+
+        Args:
+            session_id: Session identifier
+            doctor_id: Doctor ID
+            date: Date string
+            requested_time: User-provided time (may need normalization)
+            available_timeslots: Pre-fetched available slots
+
+        Returns:
+            Dict with availability status and alternatives if unavailable
+        """
+        # Step 1: Normalize the requested time
+        normalized_time = self._normalize_time_to_24hr(requested_time)
+
+        if normalized_time is None:
+            logger.warning(f"Failed to normalize time '{requested_time}' for session {session_id}")
+            return {
+                "requested_time": requested_time,
+                "available_at_requested_time": False,
+                "error": "Invalid time format",
+                "message": f"Could not parse time '{requested_time}'. Please use format like '14:00' or '2pm'"
+            }
+
+        # Step 2: Check if the normalized time is in available slots
+        is_available = self._is_time_in_available_slots(normalized_time, available_timeslots)
+
+        # Step 3a: If available, return success
+        if is_available:
+            logger.info(f"✓ Time {normalized_time} is available for doctor {doctor_id} on {date} (session: {session_id})")
+
+            # Update state with the checked time
+            self.state_manager.update_appointment_state(
+                session_id,
+                last_checked_time=normalized_time,
+                last_checked_available=True
+            )
+
+            return {
+                "requested_time": normalized_time,
+                "available_at_requested_time": True,
+                "message": f"The requested time {requested_time} is available on {date}"
+            }
+
+        # Step 3b: If NOT available, get alternatives
+        else:
+            logger.info(f"✗ Time {normalized_time} is not available for doctor {doctor_id} on {date} (session: {session_id})")
+            logger.debug(f"Fetching alternative slots closest to {normalized_time}")
+
+            # Get up to 4 closest alternative slots - pass all required parameters
+            alternatives_str = self._get_alternative_slots(
+                session_id=session_id,
+                doctor_id=doctor_id,
+                date=date,
+                requested_time=normalized_time,
+                available_timeslots=available_timeslots
+            )
+
+            logger.debug(f"Alternative slots response: {alternatives_str}")
+
+            # Parse alternatives string into list
+            alternative_slots = []
+            if alternatives_str and alternatives_str != "No alternative slots available":
+                # Split comma-separated string and clean
+                alternative_slots = [s.strip() for s in alternatives_str.split(',') if s.strip()]
+                logger.info(f"Found {len(alternative_slots)} alternative slots: {alternative_slots}")
+            else:
+                logger.warning(f"No alternative slots available for doctor {doctor_id} on {date}")
+
+            # Update state
+            self.state_manager.update_appointment_state(
+                session_id,
+                last_checked_time=normalized_time,
+                last_checked_available=False
+            )
+
+            # Build message
+            if alternative_slots:
+                alt_list = ", ".join(alternative_slots)
+                message = f"The requested time {normalized_time} is not available on {date}. Alternative times closest to your requested time: {alt_list}"
+            else:
+                message = f"The requested time {normalized_time} is not available on {date} and no alternative slots are available"
+
+            return {
+                "requested_time": normalized_time,
+                "available_at_requested_time": False,
+                "alternative_slots": alternative_slots,
+                "message": message
+            }
+
     def _calculate_availability_ranges(
         self,
         availability_windows: List[Dict[str, Any]],
@@ -822,26 +1088,46 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
         session_id: str,
         doctor_id: str,
         date: str,
-        requested_time: Optional[str] = None  # Keep as optional, but don't use it
+        requested_time: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Check doctor availability and return time ranges.
+        """Check doctor availability with two distinct modes.
 
-        Returns availability_ranges only - simple list of time ranges where doctor is available.
-        Example: ["10:00-15:00", "15:30-16:00", "16:30-17:30"]
+        MODE 1 - Range Mode (when requested_time is NOT provided):
+            Returns availability_ranges - a list of continuous time blocks where doctor is available.
+            Example: ["10:00-15:00", "15:30-16:00", "16:30-17:30"]
+
+            The ranges represent continuous blocks of available time. Use these ranges to suggest
+            appointment times to the patient.
+
+        MODE 2 - Specific Time Mode (when requested_time IS provided):
+            Checks if a specific time is available and returns alternatives if not.
+
+            Example responses:
+            - Available: {
+                "requested_time": "14:00",
+                "available_at_requested_time": True,
+                "message": "The requested time 14:00 is available on 2025-12-05"
+              }
+
+            - Not available: {
+                "requested_time": "14:00",
+                "available_at_requested_time": False,
+                "alternative_slots": ["14:30", "15:00", "13:30"],
+                "message": "The requested time 14:00 is not available on 2025-12-05. Alternative times: 14:30, 15:00, 13:30"
+              }
 
         Args:
-            doctor_id: Must be a valid UUID (use find_doctor_by_name first to get the ID)
+            session_id: Session identifier
+            doctor_id: Must be a valid UUID (use list_doctors first to get the ID)
             date: Date in YYYY-MM-DD format
-            requested_time (only when provided by patient): Optional time in HH:MM format to check specific slot availability
-
+            requested_time: Optional time to check. Supports multiple formats:
+                - "14:00", "14:30" (24-hour format)
+                - "2pm", "2:00pm", "2:00 PM" (12-hour with AM/PM)
+                - "14", "02" (hour only)
 
         Returns:
-            Dictionary with:
-            - success: Boolean
-            - date: The date checked
-            - availability_ranges: List of available time ranges
-            - count: Number of ranges
-            - message: Human-readable message
+            MODE 1 (no requested_time): {"availability_ranges": ["09:00-10:00", "10:30-15:00", ...]}
+            MODE 2 (with requested_time): See examples above
         """
         import time as time_module
         start_time = time_module.time()
@@ -858,74 +1144,90 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
             try:
                 uuid.UUID(doctor_id)
             except ValueError:
-                duration_ms = (time_module.time() - start_time) * 1000
-                result = {
-                    "success": False,
+                logger.error(f"Invalid doctor_id format: {doctor_id} (session: {session_id})")
+                error_response = {
                     "error": "Invalid doctor_id format",
-                    "message": f"doctor_id must be a UUID, not a name. Got: {doctor_id}. Please use find_doctor_by_name first to get the correct doctor ID.",
-                    "suggestion": "Use find_doctor_by_name tool first to get the doctor's UUID"
+                    "message": f"doctor_id must be a UUID, not a name. Got: {doctor_id}. Please use find_doctor_by_name first to get the correct doctor ID."
                 }
-                logger.info(f"Output: {result}")
-                logger.info(f"Time taken: {duration_ms:.2f}ms")
-                logger.info("=" * 80)
-                return result
+                # Add appropriate fields based on mode
+                if requested_time:
+                    error_response["requested_time"] = requested_time
+                    error_response["available_at_requested_time"] = False
+                else:
+                    error_response["availability_ranges"] = []
+                return error_response
 
             # Get available timeslots (pre-filtered by API)
+            logger.debug(f"Fetching available timeslots for doctor {doctor_id} on {date} (session: {session_id})")
             available_timeslots = self.db_client.get_available_time_slots(
                 doctor_id=doctor_id,
                 date=date,
                 slot_duration_minutes=30
             )
 
+            # Handle empty slots for both modes
             if not available_timeslots:
-                duration_ms = (time_module.time() - start_time) * 1000
-                result = {
-                    "success": True,
-                    "date": date,
-                    "availability_ranges": [],
-                    "count": 0,
-                    "message": f"No available slots found for {date}"
+                logger.info(f"No available slots found for doctor {doctor_id} on {date} (session: {session_id})")
+                if requested_time:
+                    return {
+                        "requested_time": requested_time,
+                        "available_at_requested_time": False,
+                        "alternative_slots": [],
+                        "message": f"No available slots on {date}"
+                    }
+                else:
+                    return {
+                        "availability_ranges": [],
+                        "message": f"No available slots on {date}"
+                    }
+
+            # MODE 1: Range Mode (existing behavior)
+            if not requested_time or requested_time.strip() == "":
+                logger.info(f"Range mode: returning availability ranges for doctor {doctor_id} on {date} (session: {session_id})")
+
+                # Merge consecutive timeslots into ranges
+                logger.debug(f"Using timeslots-based approach: {len(available_timeslots)} available slots")
+                availability_ranges = self._merge_timeslots_to_ranges(available_timeslots)
+                logger.info(f"Merged into {len(availability_ranges)} availability range(s): {availability_ranges}")
+
+                # Update agent state
+                self.state_manager.update_appointment_state(
+                    session_id,
+                    availability_ranges=availability_ranges
+                )
+
+                # Return ONLY availability_ranges - this is what the agent should use
+                return {
+                    "availability_ranges": availability_ranges
                 }
-                logger.info(f"Output: {result}")
-                logger.info(f"Time taken: {duration_ms:.2f}ms")
-                logger.info("=" * 80)
-                return result
 
-            # Merge consecutive timeslots into ranges
-            logger.info(f"Using timeslots-based approach: {len(available_timeslots)} available slots")
-            availability_ranges = self._merge_timeslots_to_ranges(available_timeslots)
-            logger.info(f"Merged into {len(availability_ranges)} availability range(s)")
-
-            # Update agent state
-            self.state_manager.update_appointment_state(
-                session_id,
-                available_slots=available_timeslots
-            )
-
-            # Simple return - ONLY availability_ranges
-            duration_ms = (time_module.time() - start_time) * 1000
-            result = {
-                "success": True,
-                "date": date,
-                "availability_ranges": availability_ranges,
-                "count": len(availability_ranges),
-                "message": f"Found {len(availability_ranges)} available time range(s) on {date}"
-            }
-            
-            logger.info(f"Output: success=True, date={date}, count={len(availability_ranges)}")
-            logger.info(f"Availability ranges: {availability_ranges}")
-            logger.info(f"Time taken: {duration_ms:.2f}ms")
-            logger.info("=" * 80)
-            
-            return result
+            # MODE 2: Specific Time Mode (new behavior)
+            else:
+                logger.info(f"Specific time mode: checking availability for '{requested_time}' on {date} (session: {session_id})")
+                return self._check_specific_time_availability(
+                    session_id=session_id,
+                    doctor_id=doctor_id,
+                    date=date,
+                    requested_time=requested_time,
+                    available_timeslots=available_timeslots
+                )
 
         except Exception as e:
-            duration_ms = (time_module.time() - start_time) * 1000
-            logger.error(f"Error checking availability: {e}")
-            logger.info(f"Output: {{'error': '{str(e)}'}}")
-            logger.info(f"Time taken: {duration_ms:.2f}ms")
-            logger.info("=" * 80)
-            return {"error": str(e)}
+            logger.error(f"Error checking availability for session {session_id}: {e}", exc_info=True)
+            # Return appropriate format based on mode
+            if requested_time:
+                return {
+                    "requested_time": requested_time,
+                    "available_at_requested_time": False,
+                    "error": str(e),
+                    "message": f"An error occurred while checking availability: {str(e)}"
+                }
+            else:
+                return {
+                    "availability_ranges": [],
+                    "error": str(e),
+                    "message": f"An error occurred while checking availability: {str(e)}"
+                }
 
     async def _execute_booking_workflow(
         self,
@@ -1216,61 +1518,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 "message": "Sorry — I couldn't schedule your appointment right now because of a system error. Would you like me to try again? (Yes / No)"
             }
     
-    def _get_alternative_slots(self, doctor_id: str, date: str, time: str) -> str:
-        """
-        Get alternative time slots closest to the requested time when unavailable.
-
-        Ranks available slots by time proximity (absolute difference in minutes).
-
-        Args:
-            doctor_id: Doctor ID
-            date: Requested date
-            time: Requested time (HH:MM format)
-
-        Returns:
-            String with up to 3 alternative slots closest to the requested time
-        """
-        try:
-            availability = self.db_client.get_doctor_availability(doctor_id, date)
-            if not availability:
-                return "No alternative slots available"
-
-            # Convert time to minutes since midnight for fast comparison
-            def time_to_minutes(time_str: str) -> int:
-                """Convert HH:MM to minutes since midnight"""
-                try:
-                    h, m = time_str[:5].split(':')
-                    return int(h) * 60 + int(m)
-                except (ValueError, IndexError):
-                    return -1  # Invalid time
-
-            requested_minutes = time_to_minutes(time)
-            if requested_minutes == -1:
-                # Fallback: return first 3 slots if time is invalid
-                slots = [slot.get('start_time', '')[:5] for slot in availability[:3] if slot.get('start_time')]
-                return ", ".join(slots) if slots else "No alternative slots available"
-
-            # Extract valid slots with their time differences
-            valid_slots = []
-            for slot in availability:
-                start = slot.get('start_time', '')[:5]
-                if start:
-                    minutes = time_to_minutes(start)
-                    if minutes != -1:
-                        valid_slots.append((start, abs(minutes - requested_minutes)))
-
-            if not valid_slots:
-                return "No alternative slots available"
-
-            # Sort by proximity (time difference) and take top 3
-            closest_slots = sorted(valid_slots, key=lambda x: x[1])[:3]
-
-            # Return just the time strings
-            return ", ".join(slot[0] for slot in closest_slots)
-
-        except Exception as e:
-            logger.warning(f"Failed to get alternative slots: {e}")
-            return "No alternative slots available"
+    
     
     def tool_book_appointment(
         self,
@@ -1378,9 +1626,6 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 "error_code": "BOOKING_EXCEPTION",
                 "message": "Sorry — I couldn't schedule your appointment right now because of a system error. Would you like me to try again? (Yes / No)"
             }
-            logger.info(f"Output: {result}")
-            logger.info(f"Time taken: {overall_duration_ms:.2f}ms")
-            logger.info("=" * 80)
             
             return result
 
@@ -1609,6 +1854,63 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
         logger.info(f"   Failed: {failed_count}/{len(appointments)}")
         logger.info(f"Output: success={all_successful}, successful_count={successful_count}, failed_count={failed_count}")
         logger.info(f"Time taken: {overall_duration_ms:.2f}ms")
+
+        # PHASE 4: Rollback on partial failure
+        rollback_result = None
+        if failed_count > 0 and successful_count > 0:
+            logger.warning(
+                f"⚠️ PARTIAL FAILURE: {successful_count} succeeded, {failed_count} failed - correlation_id={correlation_id}"
+            )
+
+            # Perform automatic rollback for consistency
+            successful_ids = [r.get("appointment_id") for r in successful_bookings if r.get("appointment_id")]
+            try:
+                loop = None
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+
+                if loop.is_running():
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        future = executor.submit(
+                            lambda: asyncio.run(
+                                self._rollback_appointments(
+                                    session_id=session_id,
+                                    appointment_ids=successful_ids,
+                                    correlation_id=correlation_id
+                                )
+                            )
+                        )
+                        rollback_result = future.result(timeout=10.0)
+                else:
+                    rollback_result = loop.run_until_complete(
+                        self._rollback_appointments(
+                            session_id=session_id,
+                            appointment_ids=successful_ids,
+                            correlation_id=correlation_id
+                        )
+                    )
+            except Exception as e:
+                logger.error(f"❌ Rollback failed: {e}")
+                rollback_result = {"error": str(e)}
+
+            return {
+                "success": False,
+                "error": "Partial booking failure - all bookings rolled back for consistency",
+                "message": (
+                    f"I wasn't able to book all {len(appointments)} appointments. "
+                    f"To keep things consistent, I've cancelled the ones that did go through. "
+                    f"Would you like me to try booking them again one at a time?"
+                ),
+                "results": results,
+                "rollback": rollback_result,
+                "successful_count": 0,  # After rollback
+                "failed_count": len(appointments),
+                "total_count": len(appointments),
+                "overall_duration_ms": round(overall_duration_ms, 2)
+            }
 
         # PHASE 4: Rollback on partial failure
         rollback_result = None

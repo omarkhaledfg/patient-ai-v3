@@ -23,7 +23,7 @@ from patient_ai_service.core.conversation_memory import (
     ConversationMemoryManager,
     get_conversation_memory_manager
 )
-from patient_ai_service.core.state_manager import get_state_manager
+from patient_ai_service.core import get_state_manager
 from patient_ai_service.models.validation import (
     ValidationResult,
     ExecutionLog,
