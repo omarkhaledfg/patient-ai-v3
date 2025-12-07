@@ -9,7 +9,9 @@ Coordinates:
 - Pub/sub messaging
 """
 
+import json
 import logging
+import re
 import time
 from contextlib import nullcontext
 from datetime import datetime
@@ -271,6 +273,35 @@ class Orchestrator:
                     )
 
             step4_duration = (time.time() - step4_start) * 1000
+
+            # ============================================================================
+            # FIX #1: EXTRACT SUCCESS CRITERIA FROM PLAN
+            # ============================================================================
+            # The reasoning engine provides a 'plan' string (e.g., "1. Verify doctor, 2. Check availability...")
+            # BaseAgent expects 'success_criteria' as a list
+            # Transform plan into success criteria
+            success_criteria = []
+            if reasoning.response_guidance.plan:
+                # Split plan by numbered steps
+                plan_steps = re.split(r'\d+\.\s+', reasoning.response_guidance.plan)
+                # Filter empty strings and clean up
+                success_criteria = [
+                    step.strip().rstrip(',') 
+                    for step in plan_steps 
+                    if step.strip()
+                ]
+                logger.info(f"Extracted {len(success_criteria)} success criteria from plan")
+                for i, criterion in enumerate(success_criteria, 1):
+                    logger.info(f"  Criterion {i}: {criterion}")
+            else:
+                # Fallback: create generic criterion from action
+                success_criteria = [f"Complete action: {reasoning.routing.action}"]
+                logger.warning(f"No plan provided by reasoning engine, using fallback criterion")
+
+            # Store success_criteria for agent context
+            reasoning.response_guidance.task_context.success_criteria = success_criteria
+            # ============================================================================
+
             logger.info(
                 f"Reasoning: agent={reasoning.routing.agent}, "
                 f"urgency={reasoning.routing.urgency}, "
@@ -355,9 +386,29 @@ class Orchestrator:
                     if hasattr(agent, 'on_activated'):
                         await agent.on_activated(session_id, reasoning)
 
-                    # Pass minimal context to agent
+                    # Build comprehensive context for agent
                     if hasattr(agent, 'set_context'):
-                        agent.set_context(session_id, reasoning.response_guidance.minimal_context)
+                        # Get continuation context from state manager
+                        continuation_context = self.state_manager.get_continuation_context(session_id)
+                        
+                        # Get language context from global state
+                        global_state = self.state_manager.get_global_state(session_id)
+                        language_context = global_state.language_context
+                        
+                        # Extract task context using helper method
+                        task_context = self._extract_task_context(reasoning, continuation_context)
+                        
+                        # Build agent context using helper method
+                        agent_context = self._build_agent_context(
+                            session_id,
+                            task_context,
+                            reasoning,
+                            language_context,
+                            continuation_context
+                        )
+                        
+                        logger.info(f"Context for agent: success_criteria={len(agent_context.get('success_criteria', []))}, entities={list(agent_context.get('entities', {}).keys())}")
+                        agent.set_context(session_id, agent_context)
                 activation_duration = (time.time() - activation_start) * 1000
                 logger.info(f"Agent activation completed in {activation_duration:.2f}ms")
 
@@ -782,3 +833,299 @@ class Orchestrator:
         self.state_manager.clear_session(session_id)
         self.memory_manager.clear_session(session_id)
         logger.info(f"Session cleared: {session_id}")
+
+    # =============================================================================
+    # HELPER METHODS FOR AGENTIC ARCHITECTURE
+    # =============================================================================
+
+    def _extract_task_context(
+        self,
+        reasoning: 'ReasoningOutput',
+        continuation_context: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """
+        Extract task context from reasoning output.
+
+        Merges with continuation context if resuming.
+        """
+        from patient_ai_service.core.reasoning import ReasoningOutput
+
+        # Get from reasoning
+        if hasattr(reasoning.response_guidance, 'task_context'):
+            tc = reasoning.response_guidance.task_context
+            task_context = {
+                "user_intent": tc.user_intent if hasattr(tc, 'user_intent') else reasoning.understanding.what_user_means,
+                "entities": tc.entities if hasattr(tc, 'entities') else {},
+                "success_criteria": tc.success_criteria if hasattr(tc, 'success_criteria') else [],
+                "constraints": tc.constraints if hasattr(tc, 'constraints') else [],
+                "prior_context": tc.prior_context if hasattr(tc, 'prior_context') else None,
+                "is_continuation": tc.is_continuation if hasattr(tc, 'is_continuation') else False,
+                "continuation_type": tc.continuation_type if hasattr(tc, 'continuation_type') else None,
+                "selected_option": tc.selected_option if hasattr(tc, 'selected_option') else None,
+            }
+            logger.info(f"{task_context}")
+
+            # Log entities extracted from reasoning
+            entities_from_reasoning = task_context["entities"]
+            if entities_from_reasoning:
+                logger.info(f"📊 Entities extracted from reasoning engine: {json.dumps(entities_from_reasoning, default=str)}")
+            else:
+                logger.info("📊 No entities extracted from reasoning engine")
+        else:
+            # Fallback to minimal_context
+            mc = reasoning.response_guidance.minimal_context
+            task_context = {
+                "user_intent": mc.get("user_wants", reasoning.understanding.what_user_means),
+                "entities": {},
+                "success_criteria": [],
+                "constraints": [],
+                "prior_context": mc.get("prior_context"),
+                "is_continuation": mc.get("is_continuation", False),
+            }
+            logger.info("📊 Using minimal_context (no task_context available)")
+
+        # Merge with continuation context if resuming
+        if continuation_context and task_context.get("is_continuation"):
+            resolved = continuation_context.get("resolved_entities", {})
+            if resolved:
+                logger.info(f"🔄 Merging resolved entities from continuation: {json.dumps(resolved, default=str)}")
+                merged_count = 0
+                for key, value in resolved.items():
+                    if key not in task_context["entities"]:
+                        task_context["entities"][key] = value
+                        merged_count += 1
+                logger.info(f"🔄 Merged {merged_count} entities from continuation context")
+
+            # Use same success criteria if resuming
+            if not task_context["success_criteria"]:
+                blocked = continuation_context.get("blocked_criteria", [])
+                if blocked:
+                    task_context["success_criteria"] = blocked
+
+            # Store continuation context for agent
+            task_context["continuation_context"] = continuation_context
+
+        # Log final entities after merging
+        final_entities = task_context["entities"]
+        logger.info(f"📊 Final task context entities (after merge): {json.dumps(final_entities, default=str)}")
+
+        return task_context
+
+    def _build_agent_context(
+        self,
+        session_id: str,
+        task_context: Dict[str, Any],
+        reasoning: 'ReasoningOutput',
+        language_context: Any,
+        continuation_context: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """
+        Build the context dict to pass to the agent.
+        Injects critical parameters like patient_id to prevent hallucinations.
+        """
+        # Get entities from task context
+        entities = task_context.get("entities", {}).copy()
+        logger.info(f"📊 Entities before enhancement: {json.dumps(entities, default=str)}")
+
+        # CRITICAL: Inject patient_id from global state to prevent hallucinations
+        # The LLM should not have to extract this from the system prompt
+        entities_added = []
+        try:
+            global_state = self.state_manager.get_global_state(session_id)
+            if global_state and global_state.patient_profile:
+                patient_id = global_state.patient_profile.patient_id
+                if patient_id and patient_id.strip():
+                    if "patient_id" not in entities:
+                        entities["patient_id"] = patient_id
+                        entities_added.append(f"patient_id={patient_id}")
+                        logger.info(f"✅ Injected patient_id into agent context: {patient_id}")
+                    else:
+                        logger.info(f"📌 patient_id already in entities: {patient_id} (from reasoning)")
+                else:
+                    logger.warning("⚠️ Patient ID not available in global state - agent may need to prompt for registration")
+        except Exception as e:
+            logger.error(f"Error injecting patient_id into context: {e}")
+
+        # Log final enhanced entities
+        if entities_added:
+            logger.info(f"📊 Enhanced entities with {len(entities_added)} injection(s): {', '.join(entities_added)}")
+        logger.info(f"📊 Final agent context entities: {json.dumps(entities, default=str)}")
+
+        context = {
+            # Task context
+            "user_intent": task_context.get("user_intent", ""),
+            "entities": entities,  # Use enhanced entities with patient_id
+            "success_criteria": task_context.get("success_criteria", []),
+            "constraints": task_context.get("constraints", []),
+            "prior_context": task_context.get("prior_context"),
+
+            # Continuation info
+            "is_continuation": task_context.get("is_continuation", False),
+            "continuation_type": task_context.get("continuation_type"),
+            "selected_option": task_context.get("selected_option"),
+            "continuation_context": continuation_context or {},
+
+            # Routing info
+            "routing_action": reasoning.routing.action,
+            "routing_urgency": reasoning.routing.urgency,
+
+            # Language
+            "current_language": language_context.current_language,
+            "current_dialect": language_context.current_dialect,
+
+            # Backward compatibility
+            "user_wants": task_context.get("user_intent", ""),
+            "action": reasoning.routing.action,
+        }
+
+        return context
+
+    async def _handle_agentic_completion(
+        self,
+        session_id: str,
+        agentic_state: 'AgenticExecutionState',
+        reasoning: 'ReasoningOutput',
+        response: str,
+        execution_log: 'ExecutionLog',
+        config_settings: Any
+    ) -> 'ValidationResult':
+        """
+        Handle different agentic completion states.
+        
+        Returns appropriate ValidationResult based on state.
+        """
+        from patient_ai_service.models.agentic import AgenticExecutionState
+        from patient_ai_service.models.validation import ValidationResult
+        
+        status = agentic_state.status
+        
+        if status == "complete":
+            # Task completed successfully
+            logger.info("✅ Agentic task completed successfully")
+            
+            # Clear any continuation context
+            self.state_manager.clear_continuation_context(session_id)
+            
+            return ValidationResult(
+                is_valid=True,
+                confidence=0.95,
+                decision="send",
+                issues=[],
+                reasoning=[f"Task completed in {agentic_state.iteration} iterations"]
+            )
+        
+        elif status == "blocked":
+            # Task blocked - waiting for user input
+            logger.info("⏸️ Agentic task blocked - awaiting user input")
+            
+            # Continuation context should already be set by agent
+            # Just verify it exists
+            if not self.state_manager.has_continuation(session_id):
+                logger.warning("Blocked status but no continuation context!")
+            
+            return ValidationResult(
+                is_valid=True,  # Response is valid (presenting options)
+                confidence=0.9,
+                decision="send",
+                issues=[],
+                reasoning=["Task blocked awaiting user input"]
+            )
+        
+        elif status == "failed":
+            # Task failed
+            logger.warning(f"❌ Agentic task failed: {agentic_state.failure_reason}")
+            
+            return ValidationResult(
+                is_valid=True,  # Failure response is valid
+                confidence=0.7,
+                decision="send",
+                issues=[agentic_state.failure_reason or "Task failed"],
+                reasoning=["Task could not be completed"]
+            )
+        
+        elif status == "max_iterations":
+            # Hit max iterations
+            logger.warning(f"⚠️ Max iterations reached ({agentic_state.max_iterations})")
+            
+            # Run validation to check response quality
+            if config_settings.enable_validation:
+                validation = await self.reasoning_engine.validate_response(
+                    session_id=session_id,
+                    original_reasoning=reasoning,
+                    agent_response=response,
+                    execution_log=execution_log
+                )
+                return validation
+            
+            return ValidationResult(
+                is_valid=True,
+                confidence=0.6,
+                decision="send",
+                issues=["Max iterations reached"],
+                reasoning=["Task incomplete due to iteration limit"]
+            )
+        
+        else:
+            # Unknown or in_progress status - run validation
+            if config_settings.enable_validation:
+                validation = await self.reasoning_engine.validate_response(
+                    session_id=session_id,
+                    original_reasoning=reasoning,
+                    agent_response=response,
+                    execution_log=execution_log
+                )
+                return validation
+            
+            return ValidationResult(
+                is_valid=True,
+                confidence=0.8,
+                decision="send"
+            )
+
+    def _build_response_metadata(
+        self,
+        agent_name: str,
+        reasoning: 'ReasoningOutput',
+        validation: 'ValidationResult',
+        finalization: Optional['ValidationResult'],
+        agentic_summary: Dict[str, Any],
+        language_context: Any
+    ) -> Dict[str, Any]:
+        """
+        Build metadata dict for ChatResponse including agentic info.
+        """
+        return {
+            "agent": agent_name,
+            "sentiment": reasoning.understanding.sentiment,
+            "is_continuation": reasoning.understanding.is_continuation,
+            "reasoning_summary": reasoning.reasoning_chain[0] if reasoning.reasoning_chain else "",
+            
+            "language_context": {
+                "language": language_context.current_language,
+                "dialect": language_context.current_dialect,
+                "full_code": language_context.get_full_language_code(),
+            },
+            
+            "validation": {
+                "passed": validation.is_valid,
+                "confidence": validation.confidence,
+                "decision": validation.decision,
+            },
+            
+            "finalization": {
+                "enabled": finalization is not None,
+                "decision": finalization.decision if finalization else None,
+                "was_edited": finalization.was_rewritten if finalization else False,
+            } if finalization else {"enabled": False},
+            
+            "agentic": {
+                "status": agentic_summary["status"],
+                "iterations": agentic_summary["iterations"],
+                "max_iterations": agentic_summary["max_iterations"],
+                "criteria": agentic_summary["criteria"],
+                "has_continuation": agentic_summary["has_continuation"],
+                "awaiting": agentic_summary.get("awaiting"),
+                "tool_calls": agentic_summary["tool_calls"],
+                "llm_calls": agentic_summary["llm_calls"],
+            }
+        }

@@ -1,29 +1,36 @@
 """
-State management for global and local agent states.
+Enhanced State Manager - Blocked Criteria and Continuation Support
 
-Supports both in-memory (development) and Redis (production) backends.
+This file contains additions to state_manager.py to support:
+1. Blocked criteria tracking
+2. Continuation context for multi-turn flows
+3. User options pending selection
+4. Enhanced agentic state management
+
+Merge these changes with your existing state_manager.py
 """
 
 import json
 import logging
-from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any, List
 from datetime import datetime
+from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, Field
-
-from patient_ai_service.models.state import (
-    GlobalState,
-    AppointmentAgentState,
-    MedicalAgentState,
-    EmergencyAgentState,
-    RegistrationState,
-    TranslationState,
-    PatientProfile,
-)
-from patient_ai_service.models.agentic import CriterionState
-from .config import settings
+from enum import Enum
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# ENUMS (import from base_agent in actual implementation)
+# =============================================================================
+
+class CriterionState(str, Enum):
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETE = "complete"
+    BLOCKED = "blocked"
+    FAILED = "failed"
+    SKIPPED = "skipped"
 
 
 # =============================================================================
@@ -138,295 +145,28 @@ class AgenticExecutionState(BaseModel):
     # Metrics
     total_llm_calls: int = 0
     total_tool_calls: int = 0
+    
+    class Config:
+        json_encoders = {
+            datetime: lambda v: v.isoformat() if v else None
+        }
 
 
-class StateBackend(ABC):
-    """Abstract backend for state storage."""
+# =============================================================================
+# STATE MANAGER METHODS TO ADD
+# =============================================================================
 
-    @abstractmethod
-    def get(self, key: str) -> Optional[str]:
-        """Get value by key."""
-        pass
-
-    @abstractmethod
-    def set(self, key: str, value: str, ttl: Optional[int] = None):
-        """Set value with optional TTL."""
-        pass
-
-    @abstractmethod
-    def delete(self, key: str):
-        """Delete key."""
-        pass
-
-    @abstractmethod
-    def exists(self, key: str) -> bool:
-        """Check if key exists."""
-        pass
-
-
-class InMemoryBackend(StateBackend):
-    """In-memory state storage for development."""
-
-    def __init__(self):
-        self._storage: Dict[str, str] = {}
-        logger.info("Initialized in-memory state backend")
-
-    def get(self, key: str) -> Optional[str]:
-        return self._storage.get(key)
-
-    def set(self, key: str, value: str, ttl: Optional[int] = None):
-        self._storage[key] = value
-        # TTL not implemented for in-memory (would need background cleanup)
-
-    def delete(self, key: str):
-        self._storage.pop(key, None)
-
-    def exists(self, key: str) -> bool:
-        return key in self._storage
-
-
-class RedisBackend(StateBackend):
-    """Redis state storage for production."""
-
-    def __init__(self, redis_url: str):
-        try:
-            import redis
-            self.client = redis.from_url(redis_url, decode_responses=True)
-            self.client.ping()  # Test connection
-            logger.info(f"Initialized Redis state backend: {redis_url}")
-        except ImportError:
-            raise ImportError("Redis package not installed. Install with: pip install redis")
-        except Exception as e:
-            logger.error(f"Failed to connect to Redis: {e}")
-            raise
-
-    def get(self, key: str) -> Optional[str]:
-        return self.client.get(key)
-
-    def set(self, key: str, value: str, ttl: Optional[int] = None):
-        if ttl:
-            self.client.setex(key, ttl, value)
-        else:
-            self.client.set(key, value)
-
-    def delete(self, key: str):
-        self.client.delete(key)
-
-    def exists(self, key: str) -> bool:
-        return self.client.exists(key) > 0
-
-
-class StateManager:
+class StateManagerAgenticMixin:
     """
-    Manages global and local agent states.
-
-    Provides type-safe access to different state models with automatic
-    serialization/deserialization and version control.
+    Mixin containing agentic state management methods.
+    
+    Add these methods to your StateManager class.
     """
-
-    def __init__(self, backend: Optional[StateBackend] = None):
-        if backend:
-            self.backend = backend
-        elif settings.redis_enabled:
-            self.backend = RedisBackend(settings.redis_url)
-        else:
-            self.backend = InMemoryBackend()
-
-        self.ttl = settings.session_ttl
-        logger.info(f"StateManager initialized with {type(self.backend).__name__}")
-
-    def _make_key(self, session_id: str, state_type: str) -> str:
-        """Generate storage key."""
-        return f"session:{session_id}:{state_type}"
-
-    # Global State Management
-
-    def get_global_state(self, session_id: str) -> GlobalState:
-        """Get global state for a session."""
-        key = self._make_key(session_id, "global_state")
-        data = self.backend.get(key)
-
-        if data:
-            try:
-                state_dict = json.loads(data)
-                return GlobalState(**state_dict)
-            except Exception as e:
-                logger.error(f"Error deserializing global state: {e}")
-
-        # Create new state if not exists
-        logger.info(f"Creating new global state for session: {session_id}")
-        return GlobalState(session_id=session_id)
-
-    def update_global_state(self, session_id: str, **kwargs):
-        """Update global state with provided fields."""
-        state = self.get_global_state(session_id)
-
-        # Update fields
-        for key, value in kwargs.items():
-            if hasattr(state, key):
-                setattr(state, key, value)
-
-        # Update metadata
-        state.updated_at = datetime.utcnow()
-        state.version += 1
-
-        # Save
-        self._save_state(session_id, "global_state", state)
-
-    def update_patient_profile(self, session_id: str, **kwargs):
-        """Update patient profile within global state."""
-        state = self.get_global_state(session_id)
-
-        # Update patient profile fields
-        for key, value in kwargs.items():
-            if hasattr(state.patient_profile, key):
-                setattr(state.patient_profile, key, value)
-
-        state.updated_at = datetime.utcnow()
-        state.version += 1
-
-        self._save_state(session_id, "global_state", state)
-
-    # Appointment Agent State
-
-    def get_appointment_state(self, session_id: str) -> AppointmentAgentState:
-        """Get appointment agent state."""
-        return self._get_local_state(
-            session_id,
-            "appointment_state",
-            AppointmentAgentState
-        )
-
-    def update_appointment_state(self, session_id: str, **kwargs):
-        """Update appointment agent state."""
-        self._update_local_state(
-            session_id,
-            "appointment_state",
-            AppointmentAgentState,
-            **kwargs
-        )
-
-    # Medical Agent State
-
-    def get_medical_state(self, session_id: str) -> MedicalAgentState:
-        """Get medical agent state."""
-        return self._get_local_state(
-            session_id,
-            "medical_state",
-            MedicalAgentState
-        )
-
-    def update_medical_state(self, session_id: str, **kwargs):
-        """Update medical agent state."""
-        self._update_local_state(
-            session_id,
-            "medical_state",
-            MedicalAgentState,
-            **kwargs
-        )
-
-    # Emergency Agent State
-
-    def get_emergency_state(self, session_id: str) -> EmergencyAgentState:
-        """Get emergency agent state."""
-        return self._get_local_state(
-            session_id,
-            "emergency_state",
-            EmergencyAgentState
-        )
-
-    def update_emergency_state(self, session_id: str, **kwargs):
-        """Update emergency agent state."""
-        self._update_local_state(
-            session_id,
-            "emergency_state",
-            EmergencyAgentState,
-            **kwargs
-        )
-
-    # Registration Agent State
-
-    def get_registration_state(self, session_id: str) -> RegistrationState:
-        """Get registration agent state."""
-        return self._get_local_state(
-            session_id,
-            "registration_state",
-            RegistrationState
-        )
-
-    def update_registration_state(self, session_id: str, **kwargs):
-        """Update registration agent state."""
-        self._update_local_state(
-            session_id,
-            "registration_state",
-            RegistrationState,
-            **kwargs
-        )
-
-    # Translation State
-
-    def get_translation_state(self, session_id: str) -> TranslationState:
-        """Get translation state."""
-        return self._get_local_state(
-            session_id,
-            "translation_state",
-            TranslationState
-        )
-
-    def update_translation_state(self, session_id: str, **kwargs):
-        """Update translation state."""
-        self._update_local_state(
-            session_id,
-            "translation_state",
-            TranslationState,
-            **kwargs
-        )
-
-    # Execution Log Management
-
-    def get_execution_log(self, session_id: str) -> Optional['ExecutionLog']:
-        """
-        Get execution log from state (for debugging/auditing).
-        
-        Note: Execution log is primarily in-memory during pipeline execution.
-        This method retrieves persisted log if available.
-        
-        Args:
-            session_id: Session identifier
-            
-        Returns:
-            ExecutionLog if found, None otherwise
-        """
-        from patient_ai_service.models.validation import ExecutionLog
-        return self._get_local_state(
-            session_id,
-            "execution_log",
-            ExecutionLog
-        )
-
-    def save_execution_log(self, session_id: str, execution_log: 'ExecutionLog'):
-        """
-        Persist execution log to state (for debugging/auditing).
-        
-        Args:
-            session_id: Session identifier
-            execution_log: ExecutionLog to persist
-        """
-        from patient_ai_service.models.validation import ExecutionLog
-        self._save_state(session_id, "execution_log", execution_log)
-
-    def clear_execution_log(self, session_id: str):
-        """
-        Clear persisted execution log.
-        
-        Args:
-            session_id: Session identifier
-        """
-        key = self._make_key(session_id, "execution_log")
-        self.backend.delete(key)
-
-    # Agentic State Management
-
+    
+    # -------------------------------------------------------------------------
+    # Core Agentic State Methods
+    # -------------------------------------------------------------------------
+    
     def get_agentic_state(self, session_id: str) -> AgenticExecutionState:
         """
         Get agentic execution state for current request.
@@ -436,20 +176,20 @@ class StateManager:
             "agentic_state",
             AgenticExecutionState
         )
-
+    
     def update_agentic_state(self, session_id: str, **kwargs):
         """
         Update agentic execution state.
         """
         state = self.get_agentic_state(session_id)
-
+        
         for key, value in kwargs.items():
             if hasattr(state, key):
                 setattr(state, key, value)
-
+        
         state.last_updated_at = datetime.utcnow()
         self._save_state(session_id, "agentic_state", state)
-
+    
     def initialize_agentic_state(
         self,
         session_id: str,
@@ -460,7 +200,7 @@ class StateManager:
         Initialize agentic state at start of request processing.
         """
         success_criteria = task_context.get("success_criteria", [])
-
+        
         # Build criteria dict
         criteria = {}
         for i, desc in enumerate(success_criteria):
@@ -471,7 +211,7 @@ class StateManager:
                 "blocked_options": None,
                 "completion_evidence": None
             }
-
+        
         state = AgenticExecutionState(
             session_id=session_id,
             iteration=0,
@@ -486,10 +226,10 @@ class StateManager:
             started_at=datetime.utcnow(),
             last_updated_at=datetime.utcnow()
         )
-
+        
         self._save_state(session_id, "agentic_state", state)
         logger.info(f"Initialized agentic state for {session_id}: {len(success_criteria)} criteria")
-
+    
     def reset_agentic_state(self, session_id: str):
         """
         Reset agentic state for new request.
@@ -497,9 +237,11 @@ class StateManager:
         key = self._make_key(session_id, "agentic_state")
         self.backend.delete(key)
         logger.debug(f"Reset agentic state for session {session_id}")
-
+    
+    # -------------------------------------------------------------------------
     # Criteria Management
-
+    # -------------------------------------------------------------------------
+    
     def mark_criterion_complete(
         self,
         session_id: str,
@@ -510,27 +252,27 @@ class StateManager:
         Mark a success criterion as complete.
         """
         state = self.get_agentic_state(session_id)
-
+        
         # Find and update criterion
         for crit_id, crit_data in state.criteria.items():
             if description.lower() in crit_data["description"].lower():
                 crit_data["state"] = CriterionState.COMPLETE.value
                 crit_data["completion_evidence"] = evidence
-
+                
                 # Update quick access list
                 if crit_data["description"] not in state.completed_criteria:
                     state.completed_criteria.append(crit_data["description"])
-
+                
                 # Remove from blocked if was blocked
                 if crit_data["description"] in state.blocked_criteria:
                     state.blocked_criteria.remove(crit_data["description"])
-
+                
                 logger.info(f"✅ Criterion complete: {crit_data['description']}")
                 break
-
+        
         state.last_updated_at = datetime.utcnow()
         self._save_state(session_id, "agentic_state", state)
-
+    
     def mark_criterion_blocked(
         self,
         session_id: str,
@@ -543,18 +285,18 @@ class StateManager:
         Mark a criterion as blocked pending user input.
         """
         state = self.get_agentic_state(session_id)
-
+        
         # Find and update criterion
         for crit_id, crit_data in state.criteria.items():
             if description.lower() in crit_data["description"].lower():
                 crit_data["state"] = CriterionState.BLOCKED.value
                 crit_data["blocked_reason"] = reason
                 crit_data["blocked_options"] = options
-
+                
                 # Update quick access list
                 if crit_data["description"] not in state.blocked_criteria:
                     state.blocked_criteria.append(crit_data["description"])
-
+                
                 # Store blocked details
                 state.blocked_details[crit_id] = BlockedCriterion(
                     criterion_id=crit_id,
@@ -563,21 +305,21 @@ class StateManager:
                     options=options or [],
                     resume_context=resume_context or {}
                 ).model_dump()
-
+                
                 logger.info(f"⏸️ Criterion blocked: {crit_data['description']} - {reason}")
                 break
-
+        
         # Update status
         state.status = "blocked"
         state.blocked_at = datetime.utcnow()
         state.last_updated_at = datetime.utcnow()
-
+        
         # Store pending options
         if options:
             state.pending_user_options = options
-
+        
         self._save_state(session_id, "agentic_state", state)
-
+    
     def mark_criterion_failed(
         self,
         session_id: str,
@@ -588,21 +330,21 @@ class StateManager:
         Mark a criterion as failed.
         """
         state = self.get_agentic_state(session_id)
-
+        
         for crit_id, crit_data in state.criteria.items():
             if description.lower() in crit_data["description"].lower():
                 crit_data["state"] = CriterionState.FAILED.value
                 crit_data["failed_reason"] = reason
-
+                
                 if crit_data["description"] not in state.failed_criteria:
                     state.failed_criteria.append(crit_data["description"])
-
+                
                 logger.warning(f"❌ Criterion failed: {crit_data['description']} - {reason}")
                 break
-
+        
         state.last_updated_at = datetime.utcnow()
         self._save_state(session_id, "agentic_state", state)
-
+    
     def unblock_criterion(
         self,
         session_id: str,
@@ -612,32 +354,34 @@ class StateManager:
         Unblock a criterion (e.g., after user provides input).
         """
         state = self.get_agentic_state(session_id)
-
+        
         for crit_id, crit_data in state.criteria.items():
             if description.lower() in crit_data["description"].lower():
                 crit_data["state"] = CriterionState.IN_PROGRESS.value
                 crit_data["blocked_reason"] = None
                 crit_data["blocked_options"] = None
-
+                
                 if crit_data["description"] in state.blocked_criteria:
                     state.blocked_criteria.remove(crit_data["description"])
-
+                
                 # Remove from blocked details
                 if crit_id in state.blocked_details:
                     del state.blocked_details[crit_id]
-
+                
                 logger.info(f"▶️ Criterion unblocked: {crit_data['description']}")
                 break
-
+        
         # Update status if no more blocked criteria
         if not state.blocked_criteria:
             state.status = "in_progress"
-
+        
         state.last_updated_at = datetime.utcnow()
         self._save_state(session_id, "agentic_state", state)
-
+    
+    # -------------------------------------------------------------------------
     # Continuation Context Management
-
+    # -------------------------------------------------------------------------
+    
     def set_continuation_context(
         self,
         session_id: str,
@@ -651,7 +395,7 @@ class StateManager:
         Set continuation context for resuming after user input.
         """
         state = self.get_agentic_state(session_id)
-
+        
         state.continuation_context = ContinuationContext(
             awaiting=awaiting,
             presented_options=options or [],
@@ -660,27 +404,27 @@ class StateManager:
             blocked_criteria=blocked_criteria or state.blocked_criteria.copy(),
             waiting_turns=0
         )
-
+        
         # Also update pending options for easy access
         if options:
             state.pending_user_options = options
-
+        
         state.last_updated_at = datetime.utcnow()
         self._save_state(session_id, "agentic_state", state)
-
+        
         logger.info(f"Set continuation context: awaiting={awaiting}, options={len(options or [])}")
-
+    
     def get_continuation_context(self, session_id: str) -> Optional[Dict[str, Any]]:
         """
         Get continuation context for resuming flow.
         """
         state = self.get_agentic_state(session_id)
-
+        
         if state.continuation_context and state.continuation_context.awaiting:
             return state.continuation_context.model_dump()
-
+        
         return None
-
+    
     def has_continuation(self, session_id: str) -> bool:
         """
         Check if there's a pending continuation.
@@ -690,7 +434,7 @@ class StateManager:
             state.continuation_context and
             state.continuation_context.awaiting
         )
-
+    
     def clear_continuation_context(self, session_id: str):
         """
         Clear continuation context after it's been handled.
@@ -700,18 +444,30 @@ class StateManager:
         state.pending_user_options = []
         state.last_updated_at = datetime.utcnow()
         self._save_state(session_id, "agentic_state", state)
-
+    
+    def increment_waiting_turns(self, session_id: str):
+        """
+        Increment the number of turns we've been waiting.
+        """
+        state = self.get_agentic_state(session_id)
+        if state.continuation_context:
+            state.continuation_context.waiting_turns += 1
+            state.last_updated_at = datetime.utcnow()
+            self._save_state(session_id, "agentic_state", state)
+    
+    # -------------------------------------------------------------------------
     # Completion Checking
-
+    # -------------------------------------------------------------------------
+    
     def is_task_complete(self, session_id: str) -> bool:
         """
         Check if all success criteria are met.
         """
         state = self.get_agentic_state(session_id)
-
+        
         if not state.success_criteria:
             return False
-
+        
         # All criteria must be complete (not pending, blocked, or failed)
         for crit_data in state.criteria.values():
             if crit_data["state"] not in [
@@ -719,34 +475,34 @@ class StateManager:
                 CriterionState.SKIPPED.value
             ]:
                 return False
-
+        
         return True
-
+    
     def has_blocked_criteria(self, session_id: str) -> bool:
         """
         Check if any criteria are blocked.
         """
         state = self.get_agentic_state(session_id)
         return len(state.blocked_criteria) > 0
-
+    
     def get_blocked_criteria(self, session_id: str) -> List[Dict[str, Any]]:
         """
         Get all blocked criteria with their details.
         """
         state = self.get_agentic_state(session_id)
-
+        
         blocked = []
         for crit_id, details in state.blocked_details.items():
             blocked.append(details if isinstance(details, dict) else details.model_dump())
-
+        
         return blocked
-
+    
     def get_pending_criteria(self, session_id: str) -> List[str]:
         """
         Get list of pending (not complete, blocked, or failed) criteria.
         """
         state = self.get_agentic_state(session_id)
-
+        
         pending = []
         for crit_data in state.criteria.values():
             if crit_data["state"] in [
@@ -754,20 +510,130 @@ class StateManager:
                 CriterionState.IN_PROGRESS.value
             ]:
                 pending.append(crit_data["description"])
-
+        
         return pending
-
+    
+    # -------------------------------------------------------------------------
+    # Observation Management
+    # -------------------------------------------------------------------------
+    
+    def add_observation(
+        self,
+        session_id: str,
+        obs_type: str,
+        name: str,
+        result: Dict[str, Any]
+    ):
+        """
+        Add an observation to agentic state.
+        """
+        state = self.get_agentic_state(session_id)
+        
+        observation = {
+            "type": obs_type,
+            "name": name,
+            "result": result,
+            "timestamp": datetime.utcnow().isoformat(),
+            "iteration": state.iteration
+        }
+        
+        state.observations.append(observation)
+        
+        if obs_type == "tool":
+            state.total_tool_calls += 1
+        
+        state.last_updated_at = datetime.utcnow()
+        self._save_state(session_id, "agentic_state", state)
+    
+    def record_decision(
+        self,
+        session_id: str,
+        decision: str,
+        reasoning: str,
+        tool_name: Optional[str] = None,
+        tool_input: Optional[Dict[str, Any]] = None
+    ):
+        """
+        Record a decision made during agentic loop.
+        """
+        state = self.get_agentic_state(session_id)
+        
+        decision_record = {
+            "iteration": state.iteration,
+            "decision": decision,
+            "reasoning": reasoning,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        if tool_name:
+            decision_record["tool_name"] = tool_name
+        if tool_input:
+            decision_record["tool_input"] = tool_input
+        
+        state.decision_history.append(decision_record)
+        state.total_llm_calls += 1
+        state.last_updated_at = datetime.utcnow()
+        
+        self._save_state(session_id, "agentic_state", state)
+    
+    # -------------------------------------------------------------------------
+    # Status Management
+    # -------------------------------------------------------------------------
+    
+    def increment_iteration(self, session_id: str) -> int:
+        """
+        Increment iteration counter and return new value.
+        """
+        state = self.get_agentic_state(session_id)
+        state.iteration += 1
+        
+        if state.iteration >= state.max_iterations:
+            state.status = "max_iterations"
+            logger.warning(f"Session {session_id} reached max iterations")
+        
+        state.last_updated_at = datetime.utcnow()
+        self._save_state(session_id, "agentic_state", state)
+        
+        return state.iteration
+    
+    def mark_task_complete(self, session_id: str):
+        """
+        Mark the agentic task as complete.
+        """
+        self.update_agentic_state(
+            session_id,
+            status="complete",
+            completed_at=datetime.utcnow()
+        )
+        logger.info(f"Session {session_id}: Task marked complete")
+    
+    def mark_task_failed(self, session_id: str, reason: str):
+        """
+        Mark the agentic task as failed.
+        """
+        self.update_agentic_state(
+            session_id,
+            status="failed",
+            failure_reason=reason,
+            completed_at=datetime.utcnow()
+        )
+        logger.warning(f"Session {session_id}: Task marked failed: {reason}")
+    
+    # -------------------------------------------------------------------------
+    # Summary and Export
+    # -------------------------------------------------------------------------
+    
     def get_agentic_summary(self, session_id: str) -> Dict[str, Any]:
         """
         Get a summary of agentic execution for logging/debugging.
         """
         state = self.get_agentic_state(session_id)
-
+        
         duration_ms = None
         if state.started_at:
             end_time = state.completed_at or datetime.utcnow()
             duration_ms = (end_time - state.started_at).total_seconds() * 1000
-
+        
         return {
             "session_id": session_id,
             "status": state.status,
@@ -789,111 +655,42 @@ class StateManager:
             "duration_ms": duration_ms
         }
 
-    # Helper Methods
 
-    def _get_local_state(self, session_id: str, state_type: str, model_class):
-        """Generic method to get local state."""
+# =============================================================================
+# UPDATED export_session AND clear_session
+# =============================================================================
+
+def export_session_updated(self, session_id: str) -> Dict[str, Any]:
+    """
+    Export all state for a session including agentic state.
+    """
+    return {
+        "global_state": self.get_global_state(session_id).model_dump(),
+        "appointment_state": self.get_appointment_state(session_id).model_dump(),
+        "medical_state": self.get_medical_state(session_id).model_dump(),
+        "emergency_state": self.get_emergency_state(session_id).model_dump(),
+        "registration_state": self.get_registration_state(session_id).model_dump(),
+        "translation_state": self.get_translation_state(session_id).model_dump(),
+        "agentic_state": self.get_agentic_state(session_id).model_dump(),
+    }
+
+
+def clear_session_updated(self, session_id: str):
+    """
+    Clear all state for a session including agentic state.
+    """
+    state_types = [
+        "global_state",
+        "appointment_state",
+        "medical_state",
+        "emergency_state",
+        "registration_state",
+        "translation_state",
+        "agentic_state",  # NEW
+    ]
+
+    for state_type in state_types:
         key = self._make_key(session_id, state_type)
-        data = self.backend.get(key)
+        self.backend.delete(key)
 
-        if data:
-            try:
-                state_dict = json.loads(data)
-                return model_class(**state_dict)
-            except Exception as e:
-                logger.error(f"Error deserializing {state_type}: {e}")
-
-        # Return new instance
-        return model_class()
-
-    def _update_local_state(self, session_id: str, state_type: str, model_class, **kwargs):
-        """Generic method to update local state."""
-        state = self._get_local_state(session_id, state_type, model_class)
-
-        # Update fields
-        for key, value in kwargs.items():
-            if hasattr(state, key):
-                setattr(state, key, value)
-
-        self._save_state(session_id, state_type, state)
-
-    def _save_state(self, session_id: str, state_type: str, state_obj):
-        """Save state object to backend."""
-        key = self._make_key(session_id, state_type)
-        data = json.dumps(state_obj.model_dump(), default=str)
-        self.backend.set(key, data, ttl=self.ttl)
-
-    # Utility Methods
-
-    def get_agent_context(self, session_id: str, agent_name: str) -> Dict[str, Any]:
-        """Get full context for an agent (global + local state)."""
-        global_state = self.get_global_state(session_id)
-        context = {
-            "session_id": session_id,
-            "patient_profile": global_state.patient_profile.model_dump(),
-            "conversation_stage": global_state.conversation_stage,
-            "detected_language": global_state.detected_language,
-            "entities_collected": global_state.entities_collected,
-        }
-
-        # Add agent-specific state
-        if agent_name == "appointment_manager":
-            context["agent_state"] = self.get_appointment_state(session_id).model_dump()
-        elif agent_name == "medical_inquiry":
-            context["agent_state"] = self.get_medical_state(session_id).model_dump()
-        elif agent_name == "emergency_response":
-            context["agent_state"] = self.get_emergency_state(session_id).model_dump()
-        elif agent_name == "registration":
-            context["agent_state"] = self.get_registration_state(session_id).model_dump()
-        elif agent_name == "translation":
-            context["agent_state"] = self.get_translation_state(session_id).model_dump()
-
-        return context
-
-    def export_session(self, session_id: str) -> Dict[str, Any]:
-        """Export all state for a session."""
-        return {
-            "global_state": self.get_global_state(session_id).model_dump(),
-            "appointment_state": self.get_appointment_state(session_id).model_dump(),
-            "medical_state": self.get_medical_state(session_id).model_dump(),
-            "emergency_state": self.get_emergency_state(session_id).model_dump(),
-            "registration_state": self.get_registration_state(session_id).model_dump(),
-            "translation_state": self.get_translation_state(session_id).model_dump(),
-            "agentic_state": self.get_agentic_state(session_id).model_dump(),
-        }
-
-    def clear_session(self, session_id: str):
-        """Clear all state for a session."""
-        state_types = [
-            "global_state",
-            "appointment_state",
-            "medical_state",
-            "emergency_state",
-            "registration_state",
-            "translation_state",
-            "agentic_state",
-        ]
-
-        for state_type in state_types:
-            key = self._make_key(session_id, state_type)
-            self.backend.delete(key)
-
-        logger.info(f"Cleared all state for session: {session_id}")
-
-
-# Global state manager instance
-_state_manager: Optional[StateManager] = None
-
-
-def get_state_manager() -> StateManager:
-    """Get or create the global state manager instance."""
-    global _state_manager
-    if _state_manager is None:
-        _state_manager = StateManager()
-    return _state_manager
-
-
-def reset_state_manager():
-    """Reset the global state manager (useful for testing)."""
-    global _state_manager
-    _state_manager = None
+    logger.info(f"Cleared all state for session: {session_id}")

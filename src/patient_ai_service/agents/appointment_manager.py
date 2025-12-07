@@ -15,6 +15,7 @@ from datetime import datetime as dt
 
 from .base_agent import BaseAgent
 from patient_ai_service.infrastructure.db_ops_client import DbOpsClient
+from patient_ai_service.models.agentic import ToolResultType
 
 logger = logging.getLogger(__name__)
 
@@ -32,11 +33,10 @@ class AppointmentManagerAgent(BaseAgent):
     """
 
     def __init__(self, db_client: Optional[DbOpsClient] = None, **kwargs):
-        # Extract max_tool_iterations from kwargs if present (not used by BaseAgent)
-        max_tool_iterations = kwargs.pop('max_tool_iterations', 15)  # Higher for complex booking flows
-        super().__init__(agent_name="AppointmentManager", **kwargs)
+        # Extract max_iterations from kwargs if present
+        max_iterations = kwargs.pop('max_iterations', 15)  # Higher for complex booking flows
+        super().__init__(agent_name="AppointmentManager", max_iterations=max_iterations, **kwargs)
         self.db_client = db_client or DbOpsClient()
-        self.max_tool_iterations = max_tool_iterations
 
     async def on_activated(self, session_id: str, reasoning: Any):
         """
@@ -110,7 +110,12 @@ class AppointmentManagerAgent(BaseAgent):
             name="list_doctors",
             function=self.tool_list_doctors,
             description="Get list of available doctors with their specialties and languages",
-            parameters={}
+            parameters={
+                "specialty": {
+                    "type": "string",
+                    "description": "Optional: Filter doctors by specialty, e.g. 'cardiology', 'pediatrics'. Leave empty to show all."
+                },
+            }
         )
 
         # Check doctor availability
@@ -173,11 +178,21 @@ class AppointmentManagerAgent(BaseAgent):
         self.register_tool(
             name="check_patient_appointments",
             function=self.tool_check_patient_appointments,
-            description="Get list of patient's appointments",
+            description="Get list of patient's appointments, optionally filtered by date and/or time",
             parameters={
                 "patient_id": {
                     "type": "string",
                     "description": "Patient's ID"
+                },
+                "appointment_date": {
+                    "type": "string",
+                    "description": "Optional date in YYYY-MM-DD format to filter appointments (e.g., '2025-11-26')",
+                    "required": False
+                },
+                "start_time": {
+                    "type": "string",
+                    "description": "Optional time in HH:MM format to filter appointments (e.g., '15:00' for 3:00 PM)",
+                    "required": False
                 }
             }
         )
@@ -580,7 +595,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
 
     # Tool implementations
 
-    def tool_list_doctors(self, session_id: str) -> Dict[str, Any]:
+    def tool_list_doctors(self, session_id: str, specialty: Optional[str] = None, search_name: Optional[str] = None) -> Dict[str, Any]:
         """Get list of available doctors."""
         import time as time_module
         start_time = time_module.time()
@@ -589,7 +604,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
         logger.info("APPOINTMENT_MANAGER: tool_list_doctors() CALLED")
         logger.info("=" * 80)
         logger.info(f"Session ID: {session_id}")
-        logger.info(f"Input: session_id={session_id}")
+        logger.info(f"Input: session_id={session_id}, specialty={specialty}, search_name={search_name}")
         
         try:
             doctors = self.db_client.get_doctors()
@@ -599,7 +614,61 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 logger.info(f"Output: {{'error': 'No doctors found'}}")
                 logger.info(f"Time taken: {duration_ms:.2f}ms")
                 logger.info("=" * 80)
-                return {"error": "No doctors found"}
+                
+                # No doctors found - provide recovery path
+                if search_name:
+                    # Name search failed - suggest listing all
+                    return {
+                        "success": True,  # Query succeeded, just no results
+                        "result_type": ToolResultType.RECOVERABLE.value,
+                        "doctors": [],
+                        "count": 0,
+                        "error": f"No doctor found matching '{search_name}'",
+                        "recovery_action": "list_doctors",  # Call without search
+                        "recovery_message": "Try listing all doctors instead",
+                        "suggested_response": f"I couldn't find a doctor named '{search_name}'. Let me show you our available doctors."
+                    }
+                else:
+                    # No doctors at all - system issue
+                    return {
+                        "success": False,
+                        "result_type": ToolResultType.SYSTEM_ERROR.value,
+                        "error": "No doctors found in system",
+                        "should_retry": False
+                    }
+
+            # Filter by specialty if provided
+            if specialty:
+                doctors = [doc for doc in doctors if doc.get("specialty", "").lower() == specialty.lower()]
+            
+            # Filter by search_name if provided
+            if search_name:
+                search_name_lower = search_name.lower()
+                matching_doctors = []
+                for doc in doctors:
+                    first_name = doc.get("first_name", "").lower()
+                    last_name = doc.get("last_name", "").lower()
+                    full_name = f"{first_name} {last_name}".strip()
+                    if search_name_lower in full_name:
+                        matching_doctors.append(doc)
+                doctors = matching_doctors
+                
+                if not doctors:
+                    # Name search failed - suggest listing all
+                    duration_ms = (time_module.time() - start_time) * 1000
+                    logger.info(f"Output: No doctor found matching '{search_name}'")
+                    logger.info(f"Time taken: {duration_ms:.2f}ms")
+                    logger.info("=" * 80)
+                    return {
+                        "success": True,  # Query succeeded, just no results
+                        "result_type": ToolResultType.RECOVERABLE.value,
+                        "doctors": [],
+                        "count": 0,
+                        "error": f"No doctor found matching '{search_name}'",
+                        "recovery_action": "list_doctors",  # Call without search
+                        "recovery_message": "Try listing all doctors instead",
+                        "suggested_response": f"I couldn't find a doctor named '{search_name}'. Let me show you our available doctors."
+                    }
 
             # Format doctor list
             doctor_list = []
@@ -608,17 +677,21 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                     "id": doc.get("id"),
                     "name": f"Dr. {doc.get('first_name')} {doc.get('last_name')}",
                     "specialty": doc.get("specialty"),
-                    "languages": doc.get("languages", ["en"])
+                    "languages": doc.get("languages", ["en"]),
+                    "next_available": doc.get("next_available")  # If available from DB
                 })
 
             duration_ms = (time_module.time() - start_time) * 1000
             result = {
                 "success": True,
+                "result_type": ToolResultType.PARTIAL.value,  # Still need to check availability and book
                 "doctors": doctor_list,
-                "count": len(doctor_list)
+                "count": len(doctor_list),
+                "next_step": "check_availability",
+                "message": f"Found {len(doctor_list)} doctor(s)"
             }
             
-            logger.info(f"Output: success=True, count={len(doctor_list)}")
+            logger.info(f"Output: success=True, count={len(doctor_list)}, result_type={result['result_type']}")
             logger.info(f"Time taken: {duration_ms:.2f}ms")
             logger.info("=" * 80)
             
@@ -626,11 +699,16 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
 
         except Exception as e:
             duration_ms = (time_module.time() - start_time) * 1000
-            logger.error(f"Error listing doctors: {e}")
+            logger.error(f"Error listing doctors: {e}", exc_info=True)
             logger.info(f"Output: {{'error': '{str(e)}'}}")
             logger.info(f"Time taken: {duration_ms:.2f}ms")
             logger.info("=" * 80)
-            return {"error": str(e)}
+            return {
+                "success": False,
+                "result_type": ToolResultType.SYSTEM_ERROR.value,
+                "error": str(e),
+                "should_retry": True
+            }
 
     def tool_find_doctor_by_name(self, session_id: str, doctor_name: str) -> Dict[str, Any]:
         """Find a doctor by name."""
@@ -913,6 +991,81 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
             logger.warning(f"Failed to get alternative slots for session {session_id}: {e}")
             return "No alternative slots available"
 
+    def _normalize_time(self, time_str: str) -> str:
+        """Normalize time to HH:MM format."""
+        normalized = self._normalize_time_to_24hr(time_str)
+        if normalized:
+            return normalized
+        return time_str  # Fallback to original if normalization fails
+    
+    def _convert_12_to_24(self, hour: str, minute: str, period: Optional[str]) -> str:
+        """Convert 12-hour time to 24-hour format."""
+        h = int(hour)
+        if period:
+            if period.lower() == 'pm' and h != 12:
+                h += 12
+            elif period.lower() == 'am' and h == 12:
+                h = 0
+        return f"{h:02d}:{minute}"
+    
+    def _find_closest_times(self, requested: str, available: List[str], count: int = 5) -> List[str]:
+        """Find times closest to the requested time."""
+        try:
+            req_minutes = int(requested.split(':')[0]) * 60 + int(requested.split(':')[1])
+            
+            def to_minutes(t):
+                parts = t.split(':')
+                return int(parts[0]) * 60 + int(parts[1])
+            
+            sorted_slots = sorted(available, key=lambda t: abs(to_minutes(t) - req_minutes))
+            return sorted_slots[:count]
+        except:
+            return available[:count]
+    
+    def _format_alternatives_message(
+        self,
+        requested: str,
+        alternatives: List[str],
+        doctor_name: Optional[str] = None
+    ) -> str:
+        """Format a user-friendly message with alternatives."""
+        doctor_str = f"with Dr. {doctor_name} " if doctor_name else ""
+        
+        if not alternatives:
+            return f"I'm sorry, {requested} isn't available {doctor_str}and there are no other times on this date."
+        
+        if len(alternatives) == 1:
+            return f"I'm sorry, {requested} isn't available {doctor_str}. Would {alternatives[0]} work instead?"
+        
+        if len(alternatives) == 2:
+            return f"I'm sorry, {requested} isn't available {doctor_str}. Would {alternatives[0]} or {alternatives[1]} work?"
+        
+        # 3 or more
+        options = ", ".join(alternatives[:2]) + f", or {alternatives[2]}"
+        return f"I'm sorry, {requested} isn't available {doctor_str}. I have {options} available. Which would you prefer?"
+    
+    def _find_next_available_date(self, doctor_id: str, from_date: str) -> Optional[str]:
+        """Find the next date with availability."""
+        try:
+            from datetime import datetime, timedelta
+            current = datetime.strptime(from_date, "%Y-%m-%d")
+            
+            for i in range(1, 14):  # Check next 2 weeks
+                next_date = current + timedelta(days=i)
+                date_str = next_date.strftime("%Y-%m-%d")
+                slots = self.db_client.get_available_time_slots(
+                    doctor_id=doctor_id,
+                    date=date_str,
+                    slot_duration_minutes=30
+                )
+                if slots and len(slots) > 0:
+                    return date_str
+            
+            return None
+        except Exception as e:
+            logger.error(f"Error finding next available date: {e}")
+            return None
+
     def _check_specific_time_availability(
         self,
         session_id: str,
@@ -1090,31 +1243,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
         date: str,
         requested_time: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Check doctor availability with two distinct modes.
-
-        MODE 1 - Range Mode (when requested_time is NOT provided):
-            Returns availability_ranges - a list of continuous time blocks where doctor is available.
-            Example: ["10:00-15:00", "15:30-16:00", "16:30-17:30"]
-
-            The ranges represent continuous blocks of available time. Use these ranges to suggest
-            appointment times to the patient.
-
-        MODE 2 - Specific Time Mode (when requested_time IS provided):
-            Checks if a specific time is available and returns alternatives if not.
-
-            Example responses:
-            - Available: {
-                "requested_time": "14:00",
-                "available_at_requested_time": True,
-                "message": "The requested time 14:00 is available on 2025-12-05"
-              }
-
-            - Not available: {
-                "requested_time": "14:00",
-                "available_at_requested_time": False,
-                "alternative_slots": ["14:30", "15:00", "13:30"],
-                "message": "The requested time 14:00 is not available on 2025-12-05. Alternative times: 14:30, 15:00, 13:30"
-              }
+        """Check doctor availability.
 
         Args:
             session_id: Session identifier
@@ -1124,10 +1253,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 - "14:00", "14:30" (24-hour format)
                 - "2pm", "2:00pm", "2:00 PM" (12-hour with AM/PM)
                 - "14", "02" (hour only)
-
-        Returns:
-            MODE 1 (no requested_time): {"availability_ranges": ["09:00-10:00", "10:30-15:00", ...]}
-            MODE 2 (with requested_time): See examples above
+        
         """
         import time as time_module
         start_time = time_module.time()
@@ -1146,8 +1272,12 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
             except ValueError:
                 logger.error(f"Invalid doctor_id format: {doctor_id} (session: {session_id})")
                 error_response = {
+                    "success": False,
+                    "result_type": ToolResultType.RECOVERABLE.value,
                     "error": "Invalid doctor_id format",
-                    "message": f"doctor_id must be a UUID, not a name. Got: {doctor_id}. Please use find_doctor_by_name first to get the correct doctor ID."
+                    "error_message": f"doctor_id must be a UUID, not a name. Got: {doctor_id}. Please use find_doctor_by_name first to get the correct doctor ID.",
+                    "recovery_action": "list_doctors",
+                    "suggested_response": "I couldn't find that doctor. Let me show you our available doctors."
                 }
                 # Add appropriate fields based on mode
                 if requested_time:
@@ -1157,6 +1287,9 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                     error_response["availability_ranges"] = []
                 return error_response
 
+            # Validate doctor exists (simplified check - in real implementation, call get_doctor)
+            # For now, we'll proceed and let the availability check handle it
+
             # Get available timeslots (pre-filtered by API)
             logger.debug(f"Fetching available timeslots for doctor {doctor_id} on {date} (session: {session_id})")
             available_timeslots = self.db_client.get_available_time_slots(
@@ -1165,23 +1298,51 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 slot_duration_minutes=30
             )
 
-            # Handle empty slots for both modes
-            if not available_timeslots:
+            # Check if no available slots (empty list)
+            if not available_timeslots or len(available_timeslots) == 0:
+                next_date = self._find_next_available_date(doctor_id, date)
                 logger.info(f"No available slots found for doctor {doctor_id} on {date} (session: {session_id})")
                 if requested_time:
                     return {
+                        "success": True,  # Query worked, just no availability
+                        "result_type": ToolResultType.USER_INPUT_NEEDED.value,
+                        "doctor_id": doctor_id,
+                        "date": date,
                         "requested_time": requested_time,
+                        "available": False,
                         "available_at_requested_time": False,
-                        "alternative_slots": [],
-                        "message": f"No available slots on {date}"
+                        "available_slots": [],
+                        "reason": "no_availability_on_date",
+                        "alternatives": [],
+                        "next_available_date": next_date,
+                        "blocks_criteria": "appointment booked",
+                        "suggested_response": f"Dr. {doctor_id} is fully booked on {date}. The next available date is {next_date}. Would that work?" if next_date else f"Dr. {doctor_id} is fully booked on {date}. Would you like to try a different date?"
                     }
                 else:
                     return {
+                        "success": True,
+                        "result_type": ToolResultType.USER_INPUT_NEEDED.value,
+                        "doctor_id": doctor_id,
+                        "date": date,
+                        "available": False,
+                        "available_slots": [],
                         "availability_ranges": [],
-                        "message": f"No available slots on {date}"
+                        "reason": "no_availability_on_date",
+                        "next_available_date": next_date,
+                        "blocks_criteria": "appointment booked",
+                        "suggested_response": f"Dr. {doctor_id} is fully booked on {date}. The next available date is {next_date}. Would that work?" if next_date else f"Dr. {doctor_id} is fully booked on {date}. Would you like to try a different date?"
                     }
 
-            # MODE 1: Range Mode (existing behavior)
+            # Extract available slot times as strings (HH:MM format)
+            available_slots = []
+            for slot in available_timeslots:
+                start_time = slot.get('start_time', '')
+                if start_time:
+                    # Extract HH:MM from time string
+                    time_str = start_time[:5] if len(start_time) >= 5 else start_time
+                    available_slots.append(time_str)
+
+            # MODE 1: Range Mode (no specific time requested)
             if not requested_time or requested_time.strip() == "":
                 logger.info(f"Range mode: returning availability ranges for doctor {doctor_id} on {date} (session: {session_id})")
 
@@ -1196,38 +1357,81 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                     availability_ranges=availability_ranges
                 )
 
-                # Return ONLY availability_ranges - this is what the agent should use
+                # Return with proper result_type
                 return {
-                    "availability_ranges": availability_ranges
+                    "success": True,
+                    "result_type": ToolResultType.PARTIAL.value,
+                    "doctor_id": doctor_id,
+                    "date": date,
+                    "available": True,
+                    "available_slots": available_slots,
+                    "availability_ranges": availability_ranges,
+                    "count": len(available_slots),
+                    "next_step": "ask_user_preferred_time_or_book",
+                    "message": f"{len(available_slots)} time slots available"
                 }
 
-            # MODE 2: Specific Time Mode (new behavior)
+            # MODE 2: Specific Time Mode
             else:
                 logger.info(f"Specific time mode: checking availability for '{requested_time}' on {date} (session: {session_id})")
-                return self._check_specific_time_availability(
-                    session_id=session_id,
-                    doctor_id=doctor_id,
-                    date=date,
-                    requested_time=requested_time,
-                    available_timeslots=available_timeslots
-                )
+                
+                # Normalize time format
+                normalized_time = self._normalize_time(requested_time)
+                
+                if normalized_time in available_slots:
+                    # ✅ Requested time IS available
+                    return {
+                        "success": True,
+                        "result_type": ToolResultType.PARTIAL.value,  # Partial - still need to book
+                        "doctor_id": doctor_id,
+                        "date": date,
+                        "requested_time": normalized_time,
+                        "available": True,
+                        "available_at_requested_time": True,
+                        "can_proceed": True,
+                        "next_step": "book_appointment",
+                        "message": f"Time {normalized_time} is available!",
+                        "booking_params": {
+                            "doctor_id": doctor_id,
+                            "date": date,
+                            "time": normalized_time
+                        }
+                    }
+                else:
+                    # ❌ Requested time NOT available - need user input
+                    # Find closest alternatives
+                    alternatives = self._find_closest_times(normalized_time, available_slots)
+                    
+                    # Get doctor name if possible (simplified - in real implementation, fetch from DB)
+                    doctor_name = None
+                    
+                    return {
+                        "success": True,  # Query succeeded!
+                        "result_type": ToolResultType.USER_INPUT_NEEDED.value,
+                        "doctor_id": doctor_id,
+                        "date": date,
+                        "requested_time": normalized_time,
+                        "available": False,
+                        "available_at_requested_time": False,
+                        "can_proceed": False,  # Cannot proceed without user choice
+                        "reason": "requested_time_unavailable",
+                        "alternatives": alternatives,
+                        "all_available_slots": available_slots,
+                        "blocks_criteria": "appointment booked",
+                        "next_action": "ask_user_for_alternative",
+                        "suggested_response": self._format_alternatives_message(
+                            normalized_time, alternatives, doctor_name
+                        )
+                    }
 
         except Exception as e:
             logger.error(f"Error checking availability for session {session_id}: {e}", exc_info=True)
-            # Return appropriate format based on mode
-            if requested_time:
-                return {
-                    "requested_time": requested_time,
-                    "available_at_requested_time": False,
-                    "error": str(e),
-                    "message": f"An error occurred while checking availability: {str(e)}"
-                }
-            else:
-                return {
-                    "availability_ranges": [],
-                    "error": str(e),
-                    "message": f"An error occurred while checking availability: {str(e)}"
-                }
+            return {
+                "success": False,
+                "result_type": ToolResultType.SYSTEM_ERROR.value,
+                "error": str(e),
+                "should_retry": True
+            }
 
     async def _execute_booking_workflow(
         self,
@@ -1276,10 +1480,59 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 logger.error(f"❌ Validation failed: patient_id is empty - correlation_id={correlation_id}")
                 return {
                     "success": False,
+                    "result_type": ToolResultType.RECOVERABLE.value,
                     "error": "Patient registration required",
                     "error_code": "VALIDATION_FAILED",
+                    "error_message": "Patient must be registered before booking",
+                    "recovery_action": "register_patient",
+                    "recovery_message": "Please register the patient first",
+                    "suggested_response": "I'll need to get you registered first. Can I have your full name and phone number?",
                     "message": "You must complete registration before booking an appointment. Please register first."
                 }
+            
+            # Step 1.5: Check for existing appointment at same time
+            try:
+                existing_appointments = self.db_client.get_patient_appointments(patient_id)
+                if existing_appointments:
+                    normalized_time = self._normalize_time(time)
+                    for existing in existing_appointments:
+                        existing_date = existing.get('appointment_date') or existing.get('date')
+                        existing_time = existing.get('start_time') or existing.get('time')
+                        if existing_time:
+                            existing_time_normalized = existing_time[:5] if len(existing_time) >= 5 else existing_time
+                            if existing_date == date and existing_time_normalized == normalized_time:
+                                # Time conflict found
+                                try:
+                                    available_slots = self.db_client.get_available_time_slots(
+                                        doctor_id=doctor_id,
+                                        date=date,
+                                        slot_duration_minutes=30
+                                    )
+                                    alternatives = []
+                                    if available_slots:
+                                        available_times = [slot.get('start_time', '')[:5] for slot in available_slots[:5] if slot.get('start_time')]
+                                        alternatives = self._find_closest_times(normalized_time, available_times)
+                                except:
+                                    alternatives = []
+                                
+                                return {
+                                    "success": False,
+                                    "result_type": ToolResultType.USER_INPUT_NEEDED.value,
+                                    "error": "time_conflict",
+                                    "error_code": "TIME_CONFLICT",
+                                    "error_message": f"You already have an appointment at {time}",
+                                    "conflicting_appointment": {
+                                        "id": existing.get("id"),
+                                        "doctor": existing.get("doctor_name") or existing.get("doctor", {}).get("name") if isinstance(existing.get("doctor"), dict) else None,
+                                        "time": existing_time_normalized,
+                                        "reason": existing.get("reason")
+                                    },
+                                    "alternatives": alternatives,
+                                    "suggested_response": f"You already have an appointment at {time}. Would you like to book for a different time, or reschedule your existing appointment?"
+                                }
+            except Exception as e:
+                logger.warning(f"Could not check for appointment conflicts: {e}")
+                # Continue with booking - conflict check is not critical
             
             # Step 2: Generate idempotency key
             idempotency_key = self._generate_idempotency_key(patient_id, doctor_id, date, time, reason)
@@ -1317,6 +1570,33 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
             end_dt = start_dt + timedelta(minutes=30)
             end_time = end_dt.strftime("%H:%M")
             
+            # Step 5.5: Verify time is still available (double-check)
+            normalized_time = self._normalize_time(time)
+            try:
+                available_slots = self.db_client.get_available_time_slots(
+                    doctor_id=doctor_id,
+                    date=date,
+                    slot_duration_minutes=30
+                )
+                if available_slots:
+                    available_times = [slot.get('start_time', '')[:5] for slot in available_slots if slot.get('start_time')]
+                    if normalized_time not in available_times:
+                        # Time no longer available
+                        alternatives = self._find_closest_times(normalized_time, available_times)
+                        return {
+                            "success": False,
+                            "result_type": ToolResultType.USER_INPUT_NEEDED.value,
+                            "error": "time_no_longer_available",
+                            "error_code": "TIME_NO_LONGER_AVAILABLE",
+                            "error_message": f"The {normalized_time} slot is no longer available",
+                            "alternatives": alternatives,
+                            "blocks_criteria": f"{reason or 'appointment'} booked",
+                            "suggested_response": f"I'm sorry, that time was just taken. Would {alternatives[0] if alternatives else 'another time'} work?"
+                        }
+            except Exception as e:
+                logger.warning(f"Could not verify time availability: {e}")
+                # Continue with booking - availability check is not critical if it fails
+            
             # Step 6: Create appointment with idempotency key (with timeout and retry)
             logger.info(f"📋 Creating appointment with idempotency_key={idempotency_key} - correlation_id={correlation_id}")
             create_start = time_module.time()
@@ -1348,8 +1628,10 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 logger.error(f"❌ Create appointment timed out - correlation_id={correlation_id}")
                 return {
                     "success": False,
+                    "result_type": ToolResultType.SYSTEM_ERROR.value,
                     "error": "Create appointment timed out",
                     "error_code": "TIMEOUT_CREATE",
+                    "should_retry": True,
                     "message": "Sorry — I couldn't schedule your appointment right now because of a system error. Would you like me to try again? (Yes / No)"
                 }
             except Exception as e:
@@ -1357,19 +1639,39 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 if "409" in error_str or "conflict" in error_str:
                     logger.warning(f"⚠️ Slot conflict detected - correlation_id={correlation_id}")
                     # Get alternatives for user
-                    alternatives = self._get_alternative_slots(doctor_id, date, time)
+                    try:
+                        available_slots = self.db_client.get_available_time_slots(
+                            doctor_id=doctor_id,
+                            date=date,
+                            slot_duration_minutes=30
+                        )
+                        if available_slots:
+                            available_times = [slot.get('start_time', '')[:5] for slot in available_slots[:5] if slot.get('start_time')]
+                            alternatives = available_times
+                        else:
+                            alternatives = []
+                    except:
+                        alternatives = []
+                    
                     return {
                         "success": False,
-                        "error": "Slot unavailable",
+                        "result_type": ToolResultType.USER_INPUT_NEEDED.value,
+                        "error": "time_no_longer_available",
                         "error_code": "SLOT_CONFLICT",
-                        "message": f"I couldn't book that time — Dr. [name] is not available at {date} {time}. Would you like these alternatives: {alternatives}?"
+                        "error_message": f"The {time} slot is no longer available",
+                        "alternatives": alternatives,
+                        "blocks_criteria": f"{reason or 'appointment'} booked",
+                        "suggested_response": f"I'm sorry, that time was just taken. Would {alternatives[0] if alternatives else 'another time'} work?",
+                        "message": f"I couldn't book that time — Dr. [name] is not available at {date} {time}. Would you like these alternatives: {', '.join(alternatives[:3]) if alternatives else 'another time'}?"
                     }
                 else:
                     logger.error(f"❌ Create appointment failed: {e} - correlation_id={correlation_id}")
                     return {
                         "success": False,
+                        "result_type": ToolResultType.SYSTEM_ERROR.value,
                         "error": str(e),
                         "error_code": "CREATE_FAILED",
+                        "should_retry": True,
                         "message": "Sorry — I couldn't schedule your appointment right now because of a system error. Would you like me to try again? (Yes / No)"
                     }
             
@@ -1377,8 +1679,11 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 logger.error(f"❌ Create appointment returned None - correlation_id={correlation_id}")
                 return {
                     "success": False,
-                    "error": "Create appointment returned None",
+                    "result_type": ToolResultType.SYSTEM_ERROR.value,
+                    "error": "booking_failed",
                     "error_code": "CREATE_RETURNED_NONE",
+                    "error_message": "Failed to create appointment in database",
+                    "should_retry": True,
                     "message": "Sorry — I couldn't schedule your appointment right now because of a system error. Would you like me to try again? (Yes / No)"
                 }
             
@@ -1411,16 +1716,20 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 # CRITICAL: Do NOT confirm if verification times out
                 return {
                     "success": False,
+                    "result_type": ToolResultType.SYSTEM_ERROR.value,
                     "error": "Final read verify timed out",
                     "error_code": "TIMEOUT_VERIFY",
+                    "should_retry": True,
                     "message": "I tried to confirm the booking but couldn't verify it in our system. I did not book the appointment. Would you like me to try again?"
                 }
             except Exception as e:
                 logger.error(f"❌ Final read verify failed: {e} - correlation_id={correlation_id}")
                 return {
                     "success": False,
+                    "result_type": ToolResultType.SYSTEM_ERROR.value,
                     "error": "Final read verify failed",
                     "error_code": "VERIFY_FAILED",
+                    "should_retry": True,
                     "message": "I tried to confirm the booking but couldn't verify it in our system. I did not book the appointment. Would you like me to try again?"
                 }
             
@@ -1446,8 +1755,10 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 
                 return {
                     "success": False,
+                    "result_type": ToolResultType.SYSTEM_ERROR.value,
                     "error": "Final read verify failed - appointment not in DB",
                     "error_code": "FINAL_VERIFY_FAILED",
+                    "should_retry": True,
                     "message": "I tried to confirm the booking but couldn't verify it in our system. I did not book the appointment. Would you like me to try again?"
                 }
             
@@ -1495,14 +1806,22 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
             )
             
             # Return success with formatted message
+            procedure_str = reason or "appointment"
             return {
                 "success": True,
+                "result_type": ToolResultType.SUCCESS.value,
+                "verified": True,
                 "appointment": verified_appointment,
                 "appointment_id": appointment_id,
-                "verified": True,
+                "satisfies_criteria": [
+                    f"{procedure_str} appointment booked",
+                    f"{procedure_str} appointment booked with appointment_id"
+                ],
                 "idempotency_key": idempotency_key,
                 "verification_latency_ms": round(verify_duration_ms, 2),
                 "workflow_latency_ms": round(workflow_duration_ms, 2),
+                "confirmation_message": f"Your {procedure_str} with {doctor_name} is confirmed for {date_display} at {time_display}.",
+                "suggested_response": f"✅ Your {procedure_str} is booked with {doctor_name} for {date_display} at {time_display}. Your confirmation number is {appointment_id[:8]}.",
                 "message": f"✅ Your appointment is confirmed.\n\n**Doctor:** {doctor_name}\n**Date:** {date_display}\n**Time:** {time_display}\n**Reason:** {reason}\n**Appointment ID:** {appointment_id}"
             }
             
@@ -1513,7 +1832,9 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
             
             return {
                 "success": False,
+                "result_type": ToolResultType.SYSTEM_ERROR.value,
                 "error": str(e),
+                "should_retry": True,
                 "error_code": "WORKFLOW_EXCEPTION",
                 "message": "Sorry — I couldn't schedule your appointment right now because of a system error. Would you like me to try again? (Yes / No)"
             }
@@ -1602,8 +1923,10 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 
                 result = {
                     "success": False,
+                    "result_type": ToolResultType.SYSTEM_ERROR.value,
                     "error": "Overall workflow timeout",
                     "error_code": "OVERALL_TIMEOUT",
+                    "should_retry": True,
                     "message": "Sorry — I couldn't schedule your appointment right now because of a system error. Would you like me to try again? (Yes / No)"
                 }
             
@@ -1612,6 +1935,61 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
             logger.info(f"Output: success={result.get('success')}, appointment_id={result.get('appointment_id', 'N/A')}")
             logger.info(f"Time taken: {overall_duration_ms:.2f}ms")
             logger.info("=" * 80)
+            
+            # Add result_type based on result (only if not already set by workflow)
+            if result.get('success'):
+                # ✅ SUCCESS!
+                # Only set if not already set by workflow
+                if 'result_type' not in result:
+                    appointment_id = result.get('appointment_id')
+                    appointment = result.get('appointment', {})
+                    doctor_name = appointment.get('doctor_name') or f"Dr. {appointment.get('doctor', {}).get('last_name', '')}" if isinstance(appointment, dict) else "Dr. [name]"
+                    procedure_str = reason or "appointment"
+                    
+                    result['result_type'] = ToolResultType.SUCCESS.value
+                    result['satisfies_criteria'] = [
+                        f"{procedure_str} appointment booked",
+                        f"{procedure_str} appointment booked with appointment_id"
+                    ]
+                    if not result.get('suggested_response'):
+                        result['suggested_response'] = f"✅ Your {procedure_str} is booked with {doctor_name} for {date} at {time}. Your confirmation number is {appointment_id[:8] if appointment_id else 'N/A'}."
+            else:
+                # Handle different error scenarios
+                error_code = result.get('error_code', '')
+                error = result.get('error', '')
+                
+                # Only set result_type if not already set by workflow
+                if 'result_type' not in result:
+                    # Patient not registered
+                    if 'VALIDATION_FAILED' in error_code or 'patient' in error.lower() and ('register' in error.lower() or 'registration' in error.lower()):
+                        result['result_type'] = ToolResultType.RECOVERABLE.value
+                        result['recovery_action'] = 'register_patient'
+                        if not result.get('suggested_response'):
+                            result['suggested_response'] = "I'll need to get you registered first. Can I have your full name and phone number?"
+                    
+                    # Time conflict or slot unavailable
+                    elif 'TIME_CONFLICT' in error_code or 'SLOT_CONFLICT' in error_code or 'TIME_NO_LONGER_AVAILABLE' in error_code or 'conflict' in error.lower() or 'unavailable' in error.lower():
+                        result['result_type'] = ToolResultType.USER_INPUT_NEEDED.value
+                        result['blocks_criteria'] = f"{reason or 'appointment'} booked"
+                        # Try to get alternatives if not already present
+                        if 'alternatives' not in result:
+                            try:
+                                # Get alternatives for the same date/time
+                                available_slots = self.db_client.get_available_time_slots(
+                                    doctor_id=doctor_id,
+                                    date=date,
+                                    slot_duration_minutes=30
+                                )
+                                if available_slots:
+                                    available_times = [slot.get('start_time', '')[:5] for slot in available_slots[:5] if slot.get('start_time')]
+                                    result['alternatives'] = available_times
+                            except:
+                                pass
+                    
+                    # System errors (timeouts, DB errors, etc.)
+                    else:
+                        result['result_type'] = ToolResultType.SYSTEM_ERROR.value
+                        result['should_retry'] = True
             
             return result
             
@@ -2041,53 +2419,115 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
     def tool_check_patient_appointments(
         self,
         session_id: str,
-        patient_id: str
+        patient_id: str,
+        appointment_date: Optional[str] = None,
+        start_time: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Get patient's appointments.""" 
+        """Get patient's appointments, optionally filtered by date and/or time.
+        
+        Args:
+            session_id: Session ID
+            patient_id: Patient's ID
+            appointment_date: Optional date in YYYY-MM-DD format to filter appointments
+            start_time: Optional time in HH:MM format to filter appointments
+        """ 
         import time as time_module
-        start_time = time_module.time()
+        start_time_func = time_module.time()
         
         logger.info("=" * 80)
         logger.info("APPOINTMENT_MANAGER: tool_check_patient_appointments() CALLED")
         logger.info("=" * 80)
         logger.info(f"Session ID: {session_id}")
-        logger.info(f"Input: patient_id={patient_id}")
+        logger.info(f"Input: patient_id={patient_id}, appointment_date={appointment_date}, start_time={start_time}")
         
         try:
-            appointments = self.db_client.get_patient_appointments(patient_id)
-
-            if not appointments:
-                duration_ms = (time_module.time() - start_time) * 1000
+            if not patient_id:
+                duration_ms = (time_module.time() - start_time_func) * 1000
                 result = {
-                    "success": True,
-                    "appointments": [],
-                    "message": "No appointments found"
+                    "success": False,
+                    "result_type": ToolResultType.RECOVERABLE.value,
+                    "error": "patient_not_registered",
+                    "recovery_action": "register_patient",
+                    "suggested_response": "I'll need to look up your patient record first. Can you confirm your name?"
                 }
                 logger.info(f"Output: {result}")
                 logger.info(f"Time taken: {duration_ms:.2f}ms")
                 logger.info("=" * 80)
                 return result
 
-            duration_ms = (time_module.time() - start_time) * 1000
+            appointments = self.db_client.get_patient_appointments(
+                patient_id, 
+                appointment_date=appointment_date, 
+                start_time=start_time
+            )
+
+            if not appointments:
+                duration_ms = (time_module.time() - start_time_func) * 1000
+                filter_msg = ""
+                if appointment_date or start_time:
+                    filter_msg = f" matching the specified criteria"
+                result = {
+                    "success": True,
+                    "result_type": ToolResultType.PARTIAL.value,  # Query worked, just empty
+                    "appointments": [],
+                    "count": 0,
+                    "message": f"No appointments found{filter_msg}",
+                    "suggested_response": f"You don't have any appointments{filter_msg}. Would you like to schedule one?"
+                }
+                logger.info(f"Output: {result}")
+                logger.info(f"Time taken: {duration_ms:.2f}ms")
+                logger.info("=" * 80)
+                return result
+
+            # Format appointments
+            formatted = []
+            for apt in appointments:
+                formatted.append({
+                    "id": apt.get("id"),
+                    "date": apt.get("date") or apt.get("appointment_date"),
+                    "time": apt.get("time") or apt.get("start_time"),
+                    "doctor_name": apt.get("doctor_name") or (apt.get("doctor", {}).get("name") if isinstance(apt.get("doctor"), dict) else None),
+                    "reason": apt.get("reason"),
+                    "status": apt.get("status")
+                })
+
+            duration_ms = (time_module.time() - start_time_func) * 1000
+            filter_info = ""
+            if appointment_date or start_time:
+                filter_parts = []
+                if appointment_date:
+                    filter_parts.append(f"date={appointment_date}")
+                if start_time:
+                    filter_parts.append(f"time={start_time}")
+                filter_info = f" (filtered by {', '.join(filter_parts)})"
+            
             result = {
                 "success": True,
-                "appointments": appointments,
-                "count": len(appointments)
+                "result_type": ToolResultType.SUCCESS.value,
+                "appointments": formatted,
+                "count": len(formatted),
+                "satisfies_criteria": ["appointments listed", "show appointments"],
+                "message": f"Found {len(formatted)} appointment(s){filter_info}"
             }
             
-            logger.info(f"Output: success=True, count={len(appointments)}")
+            logger.info(f"Output: success=True, count={len(formatted)}, result_type={result['result_type']}")
             logger.info(f"Time taken: {duration_ms:.2f}ms")
             logger.info("=" * 80)
             
             return result
 
         except Exception as e:
-            duration_ms = (time_module.time() - start_time) * 1000
-            logger.error(f"Error fetching appointments: {e}")
+            duration_ms = (time_module.time() - start_time_func) * 1000
+            logger.error(f"Error fetching appointments: {e}", exc_info=True)
             logger.info(f"Output: {{'error': '{str(e)}'}}")
             logger.info(f"Time taken: {duration_ms:.2f}ms")
             logger.info("=" * 80)
-            return {"error": str(e)}
+            return {
+                "success": False,
+                "result_type": ToolResultType.SYSTEM_ERROR.value,
+                "error": str(e),
+                "should_retry": True
+            }
 
     def tool_cancel_appointment(
         self,
@@ -2106,21 +2546,111 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
         logger.info(f"Input: appointment_id={appointment_id}, reason={reason}")
         
         try:
-            result = self.db_client.cancel_appointment(appointment_id, reason)
+            # Get appointment first to check status
+            appointment = None
+            try:
+                appointment = self.db_client.get_appointment_by_id(appointment_id)
+            except:
+                appointment = None
 
-            if result:
+            if appointment is None:
                 duration_ms = (time_module.time() - start_time) * 1000
                 output = {
-                    "success": True,
-                    "message": f"Appointment {appointment_id} cancelled successfully"
+                    "success": False,
+                    "result_type": ToolResultType.RECOVERABLE.value,
+                    "error": "appointment_not_found",
+                    "error_message": f"Appointment {appointment_id} not found",
+                    "recovery_action": "get_patient_appointments",
+                    "suggested_response": "I couldn't find that appointment. Let me show you your scheduled appointments."
                 }
                 logger.info(f"Output: {output}")
                 logger.info(f"Time taken: {duration_ms:.2f}ms")
                 logger.info("=" * 80)
                 return output
+
+            # If we have appointment info, check status and date
+            if appointment:
+                # Check if already cancelled
+                if appointment.get("status") == "cancelled":
+                    duration_ms = (time_module.time() - start_time) * 1000
+                    output = {
+                        "success": True,
+                        "result_type": ToolResultType.SUCCESS.value,
+                        "appointment_id": appointment_id,
+                        "already_cancelled": True,
+                        "message": "This appointment was already cancelled",
+                        "suggested_response": "That appointment has already been cancelled. Is there anything else I can help with?"
+                    }
+                    logger.info(f"Output: {output}")
+                    logger.info(f"Time taken: {duration_ms:.2f}ms")
+                    logger.info("=" * 80)
+                    return output
+
+                # Check if appointment is in the past
+                try:
+                    apt_date = appointment.get("date") or appointment.get("appointment_date")
+                    apt_time = appointment.get("time") or appointment.get("start_time")
+                    if apt_date and apt_time:
+                        apt_datetime = datetime.strptime(
+                            f"{apt_date} {apt_time[:5]}",
+                            "%Y-%m-%d %H:%M"
+                        )
+                        if apt_datetime < datetime.now():
+                            duration_ms = (time_module.time() - start_time) * 1000
+                            output = {
+                                "success": False,
+                                "result_type": ToolResultType.FATAL.value,
+                                "error": "appointment_in_past",
+                                "error_message": "Cannot cancel past appointments",
+                                "suggested_response": "That appointment has already passed and cannot be cancelled."
+                            }
+                            logger.info(f"Output: {output}")
+                            logger.info(f"Time taken: {duration_ms:.2f}ms")
+                            logger.info("=" * 80)
+                            return output
+                except:
+                    # If date parsing fails, continue with cancellation
+                    pass
+
+            # Perform cancellation
+            result = self.db_client.cancel_appointment(appointment_id, reason)
+
+            if result:
+                duration_ms = (time_module.time() - start_time) * 1000
+                apt_date = appointment.get("date") or appointment.get("appointment_date") if appointment else None
+                apt_time = appointment.get("time") or appointment.get("start_time") if appointment else None
+                
+                output = {
+                    "success": True,
+                    "result_type": ToolResultType.SUCCESS.value,
+                    "cancelled": True,
+                    "appointment_id": appointment_id,
+                    "cancelled_appointment": {
+                        "date": apt_date,
+                        "time": apt_time,
+                        "doctor": appointment.get("doctor_name") if appointment else None,
+                        "reason": appointment.get("reason") if appointment else None
+                    } if appointment else None,
+                    "satisfies_criteria": [
+                        "appointment cancelled",
+                        f"appointment {appointment_id} cancelled"
+                    ],
+                    "suggested_response": f"I've cancelled your appointment{f' on {apt_date} at {apt_time}' if apt_date and apt_time else ''}. Is there anything else I can help with?",
+                    "message": f"Appointment {appointment_id} cancelled successfully"
+                }
+                logger.info(f"Output: success=True, result_type={output['result_type']}")
+                logger.info(f"Time taken: {duration_ms:.2f}ms")
+                logger.info("=" * 80)
+                return output
             else:
                 duration_ms = (time_module.time() - start_time) * 1000
-                output = {"error": "Failed to cancel appointment"}
+                output = {
+                    "success": False,
+                    "result_type": ToolResultType.SYSTEM_ERROR.value,
+                    "error": "cancellation_failed",
+                    "should_retry": True,
+                    "message": "Failed to cancel appointment"
+                }
                 logger.info(f"Output: {output}")
                 logger.info(f"Time taken: {duration_ms:.2f}ms")
                 logger.info("=" * 80)
@@ -2128,11 +2658,16 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
 
         except Exception as e:
             duration_ms = (time_module.time() - start_time) * 1000
-            logger.error(f"Error cancelling appointment: {e}")
+            logger.error(f"Error cancelling appointment: {e}", exc_info=True)
             logger.info(f"Output: {{'error': '{str(e)}'}}")
             logger.info(f"Time taken: {duration_ms:.2f}ms")
             logger.info("=" * 80)
-            return {"error": str(e)}
+            return {
+                "success": False,
+                "result_type": ToolResultType.SYSTEM_ERROR.value,
+                "error": str(e),
+                "should_retry": True
+            }
 
     def tool_reschedule_appointment(
         self,
@@ -2152,32 +2687,114 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
         logger.info(f"Input: appointment_id={appointment_id}, new_date={new_date}, new_time={new_time}")
         
         try:
+            # Get existing appointment
+            try:
+                appointment = self.db_client.get_appointment_by_id(appointment_id)
+            except:
+                appointment = None
+
+            if not appointment:
+                duration_ms = (time_module.time() - start_time) * 1000
+                output = {
+                    "success": False,
+                    "result_type": ToolResultType.RECOVERABLE.value,
+                    "error": "appointment_not_found",
+                    "recovery_action": "get_patient_appointments",
+                    "suggested_response": "I couldn't find that appointment. Let me show you your scheduled appointments."
+                }
+                logger.info(f"Output: {output}")
+                logger.info(f"Time taken: {duration_ms:.2f}ms")
+                logger.info("=" * 80)
+                return output
+
+            # Use existing values if not provided (though both are required in current signature)
+            target_date = new_date or appointment.get("date") or appointment.get("appointment_date")
+            target_time = self._normalize_time(new_time) if new_time else (appointment.get("time") or appointment.get("start_time"))
+            doctor_id = appointment.get("doctor_id")
+
+            # Check new time is available
+            try:
+                available_slots = self.db_client.get_available_time_slots(
+                    doctor_id=doctor_id,
+                    date=target_date,
+                    slot_duration_minutes=30
+                )
+                if available_slots:
+                    available_times = [slot.get('start_time', '')[:5] for slot in available_slots if slot.get('start_time')]
+                    if target_time not in available_times:
+                        # New time unavailable
+                        alternatives = self._find_closest_times(target_time, available_times)
+                        duration_ms = (time_module.time() - start_time) * 1000
+                        output = {
+                            "success": True,
+                            "result_type": ToolResultType.USER_INPUT_NEEDED.value,
+                            "error": "new_time_unavailable",
+                            "requested_time": target_time,
+                            "requested_date": target_date,
+                            "available": False,
+                            "alternatives": alternatives,
+                            "blocks_criteria": "appointment rescheduled",
+                            "suggested_response": f"{target_time} on {target_date} isn't available. Would {alternatives[0] if alternatives else 'another time'} work?"
+                        }
+                        logger.info(f"Output: {output}")
+                        logger.info(f"Time taken: {duration_ms:.2f}ms")
+                        logger.info("=" * 80)
+                        return output
+            except Exception as e:
+                logger.warning(f"Could not check availability for reschedule: {e}")
+                # Continue with reschedule - availability check is not critical if it fails
+
             # Calculate new end time
-            start_dt = datetime.strptime(new_time, "%H:%M")
+            start_dt = datetime.strptime(target_time, "%H:%M")
             end_dt = start_dt + timedelta(minutes=30)
             new_end_time = end_dt.strftime("%H:%M")
 
             result = self.db_client.reschedule_appointment(
                 appointment_id,
-                new_date,
-                new_time,
+                target_date,
+                target_time,
                 new_end_time
             )
 
             if result:
                 duration_ms = (time_module.time() - start_time) * 1000
+                prev_date = appointment.get("date") or appointment.get("appointment_date")
+                prev_time = appointment.get("time") or appointment.get("start_time")
+                
                 output = {
                     "success": True,
+                    "result_type": ToolResultType.SUCCESS.value,
+                    "rescheduled": True,
+                    "appointment_id": appointment_id,
                     "appointment": result,
-                    "message": f"Appointment rescheduled to {new_date} at {new_time}"
+                    "previous": {
+                        "date": prev_date,
+                        "time": prev_time
+                    },
+                    "new": {
+                        "date": target_date,
+                        "time": target_time
+                    },
+                    "satisfies_criteria": [
+                        "appointment rescheduled",
+                        f"appointment {appointment_id} rescheduled"
+                    ],
+                    "suggested_response": f"Done! I've rescheduled your appointment from {prev_date} {prev_time} to {target_date} at {target_time}.",
+                    "message": f"Appointment rescheduled to {target_date} at {target_time}"
                 }
-                logger.info(f"Output: success=True, appointment_id={result.get('id', 'N/A')}")
+                logger.info(f"Output: success=True, result_type={output['result_type']}, appointment_id={result.get('id', 'N/A')}")
                 logger.info(f"Time taken: {duration_ms:.2f}ms")
                 logger.info("=" * 80)
                 return output
             else:
                 duration_ms = (time_module.time() - start_time) * 1000
-                output = {"error": "Failed to reschedule appointment"}
+                output = {
+                    "success": False,
+                    "result_type": ToolResultType.SYSTEM_ERROR.value,
+                    "error": "reschedule_failed",
+                    "should_retry": True,
+                    "message": "Failed to reschedule appointment"
+                }
                 logger.info(f"Output: {output}")
                 logger.info(f"Time taken: {duration_ms:.2f}ms")
                 logger.info("=" * 80)
@@ -2185,11 +2802,16 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
 
         except Exception as e:
             duration_ms = (time_module.time() - start_time) * 1000
-            logger.error(f"Error rescheduling appointment: {e}")
+            logger.error(f"Error rescheduling appointment: {e}", exc_info=True)
             logger.info(f"Output: {{'error': '{str(e)}'}}")
             logger.info(f"Time taken: {duration_ms:.2f}ms")
             logger.info("=" * 80)
-            return {"error": str(e)}
+            return {
+                "success": False,
+                "result_type": ToolResultType.SYSTEM_ERROR.value,
+                "error": str(e),
+                "should_retry": True
+            }
 
     def tool_update_appointment(
         self,
@@ -2208,7 +2830,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
         emergency_level: Optional[str] = None,
         follow_up_required: Optional[bool] = None,
         follow_up_days: Optional[int] = None,
-        procedure_type: Optional[str] = None
+        procedure_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Update an appointment with one or more parameters.
@@ -2269,8 +2891,8 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 updates["follow_up_required"] = follow_up_required
             if follow_up_days is not None:
                 updates["follow_up_days"] = follow_up_days
-            if procedure_type is not None:
-                updates["procedure_type"] = procedure_type
+            if procedure_id is not None:
+                updates["procedure_id"] = procedure_id
             
             # Check if at least one field is being updated
             if not updates:
@@ -2281,10 +2903,73 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
             
             logger.info(f"Updating appointment {appointment_id} with fields: {list(updates.keys())}")
             
+            # Track doctor_id if it's being updated for verification
+            requested_doctor_id = updates.get("doctor_id")
+            if requested_doctor_id:
+                logger.info(f"🔍 AppointmentManager: Requesting doctor_id update to: {requested_doctor_id}")
+            
             # Call the database client update method
             result = self.db_client.update_appointment(appointment_id, updates)
             
+            '''FIXTUR -> add validation to all other parameters'''
+            
             if result:
+                # Phase 1 & 4: Verification step - Verify doctor_id was persisted
+                # Phase 4: Explicit error handling for unsupported field updates
+                if requested_doctor_id:
+                    logger.info(f"🔍 AppointmentManager: Verifying doctor_id update...")
+                    response_doctor_id = result.get("doctor_id")
+                    logger.info(f"🔍 AppointmentManager: Response doctor_id: {response_doctor_id}")
+                    
+                    # Fetch appointment from DB to verify actual persistence
+                    try:
+                        fetched_appointment = self.db_client.get_appointment_by_id(appointment_id)
+                        if fetched_appointment:
+                            fetched_doctor_id = fetched_appointment.get("doctor_id")
+                            logger.info(f"🔍 AppointmentManager: Fetched doctor_id from DB: {fetched_doctor_id}")
+                            
+                            if fetched_doctor_id != requested_doctor_id:
+                                logger.error(
+                                    f"❌ AppointmentManager: DOCTOR_ID UPDATE FAILED - "
+                                    f"Requested: {requested_doctor_id}, "
+                                    f"Database has: {fetched_doctor_id}"
+                                )
+                                
+                                # Phase 4: Determine which fields succeeded vs failed
+                                succeeded_fields = []
+                                failed_fields = ["doctor_id"]
+                                
+                                # Check other fields that were updated
+                                for field, value in updates.items():
+                                    if field != "doctor_id":
+                                        db_value = fetched_appointment.get(field)
+                                        if db_value == value or (field in ["start_time", "end_time"] and str(db_value)[:5] == str(value)[:5]):
+                                            succeeded_fields.append(field)
+                                        else:
+                                            failed_fields.append(field)
+                                
+                                # Return explicit error about doctor_id update failure
+                                error_msg = (
+                                    f"doctor_id update failed - backend may not support updating doctor_id field. "
+                                    f"Requested: {requested_doctor_id}, but database still has: {fetched_doctor_id}. "
+                                    f"Other fields may have been updated successfully."
+                                )
+                                
+                                return {
+                                    "success": False,
+                                    "error": error_msg,
+                                    "appointment": fetched_appointment,
+                                    "updated_fields": succeeded_fields,
+                                    "failed_fields": failed_fields,
+                                    "doctor_id_update_failed": True
+                                }
+                            else:
+                                logger.info(f"✅ AppointmentManager: Doctor_id successfully updated to {fetched_doctor_id}")
+                        else:
+                            logger.warning(f"⚠️ AppointmentManager: Could not fetch appointment for verification")
+                    except Exception as e:
+                        logger.warning(f"⚠️ AppointmentManager: Error verifying appointment: {e}")
+                
                 # Format success message with what was updated
                 updated_fields = list(updates.keys())
                 return {

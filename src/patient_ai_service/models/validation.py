@@ -15,6 +15,9 @@ class ToolExecution(BaseModel):
     inputs: Dict[str, Any]
     outputs: Dict[str, Any]
     timestamp: datetime = Field(default_factory=datetime.utcnow)
+    success: bool = True
+    duration_ms: Optional[float] = None
+    error: Optional[str] = None
 
 
 class ExecutionLog(BaseModel):

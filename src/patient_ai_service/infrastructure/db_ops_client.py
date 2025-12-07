@@ -2,6 +2,7 @@ import requests
 import os
 import logging
 import time
+import json
 from typing import Optional, Dict, Any, List # Added for type hinting
 
 # Configure logging
@@ -557,7 +558,7 @@ class DbOpsClient:
         - emergency_level: Change emergency level (routine, urgent, emergency, critical)
         - follow_up_required: Boolean
         - follow_up_days: Number of days
-        - procedure_type: Procedure type string
+        - procedure_id: Procedure ID (UUID)
         
         Args:
             appointment_id: The appointment ID to update
@@ -567,7 +568,63 @@ class DbOpsClient:
             Updated appointment dict if successful, None if error
         """
         logger.info(f"Updating appointment ID: {appointment_id} with fields: {list(updates.keys())}")
-        return self._make_request("PATCH", f"/appointments/{appointment_id}", json_data=updates)
+        
+        # Phase 1: Enhanced logging - Log exact payload being sent
+        logger.info(f"🔍 PATCH /appointments/{appointment_id} payload: {json.dumps(updates, indent=2)}")
+        
+        # Track if doctor_id is being updated for verification
+        doctor_id_in_request = updates.get("doctor_id")
+        if doctor_id_in_request:
+            logger.info(f"🔍 Attempting to update doctor_id to: {doctor_id_in_request}")
+        
+        # Make the API request
+        result = self._make_request("PATCH", f"/appointments/{appointment_id}", json_data=updates)
+        
+        # Phase 1: Response validation - Verify persistence by fetching appointment
+        # Phase 4: Ensure response reflects actual DB state
+        if result:
+            logger.info(f"🔍 API response received. Verifying persistence and fetching actual DB state...")
+            logger.info(f"🔍 Response doctor_id: {result.get('doctor_id')}")
+            
+            # Fetch appointment from DB to get actual state (not just API response echo)
+            try:
+                fetched_appointment = self.get_appointment_by_id(appointment_id)
+                if fetched_appointment:
+                    # Phase 4: Return fetched appointment to ensure response reflects DB state
+                    logger.info(f"🔍 Returning fetched appointment (actual DB state) instead of API response")
+                    
+                    # Verify doctor_id if it was in the request
+                    if doctor_id_in_request:
+                        fetched_doctor_id = fetched_appointment.get("doctor_id")
+                        logger.info(f"🔍 Fetched appointment doctor_id from DB: {fetched_doctor_id}")
+                        
+                        # Compare response vs. database state
+                        response_doctor_id = result.get("doctor_id")
+                        if response_doctor_id != fetched_doctor_id:
+                            logger.warning(
+                                f"⚠️ DOCTOR_ID MISMATCH DETECTED: "
+                                f"Requested={doctor_id_in_request}, "
+                                f"Response={response_doctor_id}, "
+                                f"Database={fetched_doctor_id}"
+                            )
+                        elif fetched_doctor_id != doctor_id_in_request:
+                            logger.error(
+                                f"❌ DOCTOR_ID UPDATE FAILED: "
+                                f"Requested={doctor_id_in_request}, "
+                                f"Database still has={fetched_doctor_id}. "
+                                f"Backend may not support doctor_id updates."
+                            )
+                        else:
+                            logger.info(f"✅ Doctor_id successfully persisted: {fetched_doctor_id}")
+                    
+                    # Return fetched appointment (actual DB state) instead of API response
+                    return fetched_appointment
+                else:
+                    logger.warning(f"⚠️ Could not fetch appointment {appointment_id} for verification, returning API response")
+            except Exception as e:
+                logger.warning(f"⚠️ Error fetching appointment for verification: {e}, returning API response")
+        
+        return result
 
     def get_patient_by_id(self, patient_id: Optional[str]) -> Optional[Dict[str, Any]]:
         if not patient_id:
@@ -891,9 +948,58 @@ class DbOpsClient:
         logger.info("Fetching all clinic branches")
         return self._make_request("GET", "/clinics")
 
-    def get_patient_appointments(self, patient_id: str) -> Optional[List[Dict[str, Any]]]:
-        logger.info(f"Fetching appointments for patient ID: {patient_id}")
-        return self._make_request("GET", f"/appointments/patient/{patient_id}")
+    def get_patient_appointments(
+        self, 
+        patient_id: str, 
+        appointment_date: Optional[str] = None,
+        start_time: Optional[str] = None
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Get appointments for a patient, optionally filtered by date and time.
+        
+        Args:
+            patient_id: Patient's UUID
+            appointment_date: Optional date in YYYY-MM-DD format to filter appointments
+            start_time: Optional time in HH:MM format to filter appointments
+        
+        Returns:
+            List of appointment dictionaries or None if error
+        """
+        logger.info(f"Fetching appointments for patient ID: {patient_id}, Date: {appointment_date}, Time: {start_time}")
+        
+        # Pass query parameters to API for server-side filtering
+        params = {}
+        if appointment_date:
+            params["appointment_date"] = appointment_date
+        if start_time:
+            # Backend expects HH:MM format, will convert to HH:MM:SS if needed
+            params["start_time"] = start_time
+        
+        appointments = self._make_request("GET", f"/appointments/patient/{patient_id}", params=params if params else None)
+        
+        # Client-side filtering as fallback (in case API doesn't support filtering yet)
+        if appointments and (appointment_date or start_time):
+            filtered = appointments
+            if appointment_date:
+                # Handle different date formats (YYYY-MM-DD or with time)
+                filtered = [
+                    apt for apt in filtered 
+                    if (apt.get("appointment_date") == appointment_date or 
+                        apt.get("date") == appointment_date or
+                        (apt.get("appointment_date") and appointment_date in str(apt.get("appointment_date"))) or
+                        (apt.get("date") and appointment_date in str(apt.get("date"))))
+                ]
+            if start_time:
+                # Compare HH:MM part of time
+                time_short = start_time[:5] if len(start_time) >= 5 else start_time
+                filtered = [
+                    apt for apt in filtered 
+                    if (apt.get("start_time") and time_short == str(apt.get("start_time"))[:5]) or
+                       (apt.get("time") and time_short == str(apt.get("time"))[:5])
+                ]
+            logger.info(f"Client-side filtered to {len(filtered)} appointments matching criteria")
+            return filtered
+        
+        return appointments
 
     def get_insurance_providers(self) -> Optional[List[Dict[str, Any]]]:
         """Get all insurance providers from clinic_insurance_providers table."""

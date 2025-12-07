@@ -38,6 +38,8 @@ class UnderstandingResult(BaseModel):
     """What the reasoning engine understood about the user's message."""
     what_user_means: str
     is_continuation: bool = False
+    continuation_type: Optional[str] = None  # "selection", "confirmation", "rejection", "modification", "clarification"
+    selected_option: Optional[Any] = None  # The option user selected
     sentiment: str = "neutral"  # "affirmative", "negative", "neutral", "unclear"
     is_conversation_restart: bool = False
 
@@ -56,11 +58,28 @@ class MemoryUpdate(BaseModel):
     awaiting: str = ""
 
 
+class TaskContext(BaseModel):
+    """
+    Structured context for agent execution.
+    """
+    user_intent: str = ""
+    entities: Dict[str, Any] = Field(default_factory=dict)
+    success_criteria: List[str] = Field(default_factory=list)
+    constraints: List[str] = Field(default_factory=list)
+    prior_context: Optional[str] = None
+    
+    # Continuation fields
+    is_continuation: bool = False
+    continuation_type: Optional[str] = None  # "selection", "confirmation", "clarification"
+    selected_option: Optional[Any] = None  # The option user selected
+    continuation_context: Optional[Dict[str, Any]] = Field(default=None)
+
 class ResponseGuidance(BaseModel):
     """Guidance for the selected agent's response."""
     tone: str = "helpful"  # "helpful", "empathetic", "urgent", "professional"
+    task_context: TaskContext = Field(default_factory=TaskContext)
     minimal_context: Dict[str, Any] = Field(default_factory=dict)
-    plan: str = ""  # Short step-by-step plan/command for the agent to follow
+    plan: str = ""  # Short step-by-step plan/command for the agent to follow (deprecated)
 
 
 class ReasoningOutput(BaseModel):
@@ -70,6 +89,186 @@ class ReasoningOutput(BaseModel):
     memory_updates: MemoryUpdate
     response_guidance: ResponseGuidance
     reasoning_chain: List[str] = Field(default_factory=list)
+
+
+# =============================================================================
+# CONTINUATION DETECTION
+# =============================================================================
+
+class ContinuationDetector:
+    """
+    Detects when a user message is a continuation/response to previous options.
+    """
+    
+    # Affirmative responses
+    AFFIRMATIVE_PATTERNS = [
+        r"^(yes|yeah|yep|yup|sure|ok|okay|alright|sounds good|perfect|great|fine)\.?$",
+        r"^(that works|that\'s fine|that\'s good|go ahead|please do|do it)\.?$",
+        r"^(the first one|the second one|the third one|first|second|third)\.?$",
+        r"^(option [123a-c]|[123a-c])\.?$"
+    ]
+    
+    # Time selection patterns
+    TIME_PATTERNS = [
+        r"^(\d{1,2})(:\d{2})?\s*(am|pm)?\.?$",  # "3", "3pm", "3:00 pm"
+        r"^(the )?\d{1,2}(:\d{2})?\s*(am|pm)?( one)?\.?$",  # "the 3pm one"
+    ]
+    
+    # Negative responses
+    NEGATIVE_PATTERNS = [
+        r"^(no|nope|nah|not really|neither|none)\.?$",
+        r"^(actually|wait|hold on|never ?mind)\.?",
+    ]
+    
+    @classmethod
+    def detect_continuation_type(
+        cls,
+        message: str,
+        awaiting: Optional[str] = None,
+        presented_options: Optional[List[Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Detect if message is a continuation and what type.
+        
+        Returns:
+            {
+                "is_continuation": True/False,
+                "continuation_type": "selection" | "confirmation" | "rejection" | "modification",
+                "selected_option": The option user selected (if applicable),
+                "confidence": 0.0-1.0
+            }
+        """
+        message_lower = message.lower().strip()
+        
+        result = {
+            "is_continuation": False,
+            "continuation_type": None,
+            "selected_option": None,
+            "confidence": 0.0
+        }
+        
+        # Check for affirmative response
+        for pattern in cls.AFFIRMATIVE_PATTERNS:
+            if re.match(pattern, message_lower, re.IGNORECASE):
+                result["is_continuation"] = True
+                result["continuation_type"] = "confirmation"
+                result["confidence"] = 0.9
+                
+                # Check for ordinal selection
+                if "first" in message_lower and presented_options:
+                    result["continuation_type"] = "selection"
+                    result["selected_option"] = presented_options[0] if presented_options else None
+                elif "second" in message_lower and presented_options and len(presented_options) > 1:
+                    result["continuation_type"] = "selection"
+                    result["selected_option"] = presented_options[1]
+                elif "third" in message_lower and presented_options and len(presented_options) > 2:
+                    result["continuation_type"] = "selection"
+                    result["selected_option"] = presented_options[2]
+                
+                return result
+        
+        # Check for time selection
+        for pattern in cls.TIME_PATTERNS:
+            match = re.match(pattern, message_lower, re.IGNORECASE)
+            if match:
+                result["is_continuation"] = True
+                result["continuation_type"] = "selection"
+                result["confidence"] = 0.85
+                
+                # Extract the time value
+                time_value = cls._extract_time(message_lower)
+                result["selected_option"] = time_value
+                
+                # Validate against presented options if available
+                if presented_options:
+                    matched = cls._match_time_to_options(time_value, presented_options)
+                    if matched:
+                        result["selected_option"] = matched
+                        result["confidence"] = 0.95
+                
+                return result
+        
+        # Check for negative response
+        for pattern in cls.NEGATIVE_PATTERNS:
+            if re.match(pattern, message_lower, re.IGNORECASE):
+                result["is_continuation"] = True
+                result["continuation_type"] = "rejection"
+                result["confidence"] = 0.85
+                return result
+        
+        # Check if it matches one of the presented options directly
+        if presented_options:
+            for option in presented_options:
+                option_str = str(option).lower()
+                if option_str in message_lower or message_lower in option_str:
+                    result["is_continuation"] = True
+                    result["continuation_type"] = "selection"
+                    result["selected_option"] = option
+                    result["confidence"] = 0.95
+                    return result
+        
+        # Check based on what we're awaiting
+        if awaiting:
+            if awaiting == "time_selection" and cls._looks_like_time(message_lower):
+                result["is_continuation"] = True
+                result["continuation_type"] = "selection"
+                result["selected_option"] = cls._extract_time(message_lower)
+                result["confidence"] = 0.8
+                return result
+            
+            elif awaiting == "confirmation" and len(message_lower) < 20:
+                # Short message when awaiting confirmation is likely a response
+                result["is_continuation"] = True
+                result["continuation_type"] = "clarification"
+                result["confidence"] = 0.6
+                return result
+        
+        return result
+    
+    @classmethod
+    def _extract_time(cls, message: str) -> str:
+        """Extract time value from message."""
+        # Look for time patterns
+        match = re.search(r'(\d{1,2})(?::(\d{2}))?\s*(am|pm)?', message, re.IGNORECASE)
+        if match:
+            hour = match.group(1)
+            minute = match.group(2) or "00"
+            period = match.group(3)
+            
+            if period:
+                return f"{hour}:{minute} {period}"
+            return f"{hour}:{minute}"
+        
+        return message
+    
+    @classmethod
+    def _looks_like_time(cls, message: str) -> bool:
+        """Check if message looks like a time."""
+        return bool(re.search(r'\d{1,2}(:\d{2})?\s*(am|pm)?', message, re.IGNORECASE))
+    
+    @classmethod
+    def _match_time_to_options(cls, time_value: str, options: List[Any]) -> Optional[Any]:
+        """Try to match a time value to one of the presented options."""
+        # Normalize the time
+        time_lower = time_value.lower().replace(" ", "")
+        
+        for option in options:
+            option_str = str(option).lower().replace(" ", "")
+            
+            # Direct match
+            if time_lower == option_str:
+                return option
+            
+            # Extract hour and check
+            time_match = re.search(r'(\d{1,2})', time_lower)
+            option_match = re.search(r'(\d{1,2})', option_str)
+            
+            if time_match and option_match:
+                if time_match.group(1) == option_match.group(1):
+                    # Same hour - likely a match
+                    return option
+        
+        return None
 
 
 class ReasoningEngine:
@@ -150,6 +349,30 @@ class ReasoningEngine:
         # Get conversation memory
         memory = self.memory_manager.get_memory(session_id)
 
+        # Get continuation context from state manager
+        continuation_context = None
+        try:
+            continuation_context = self.state_manager.get_continuation_context(session_id)
+        except Exception as e:
+            logger.debug(f"Could not get continuation context: {e}")
+            continuation_context = None
+
+        # Pre-detect continuation to help LLM
+        continuation_detection = None
+        if continuation_context:
+            continuation_detection = ContinuationDetector.detect_continuation_type(
+                user_message,
+                awaiting=continuation_context.get("awaiting"),
+                presented_options=continuation_context.get("presented_options")
+            )
+            
+            if continuation_detection.get("is_continuation"):
+                logger.info(
+                    f"Pre-detected continuation: type={continuation_detection.get('continuation_type')}, "
+                    f"selected={continuation_detection.get('selected_option')}, "
+                    f"confidence={continuation_detection.get('confidence')}"
+                )
+
         # Check for conversation restart
         if self.memory_manager.is_conversation_restart(session_id, user_message):
             logger.info(f"Conversation restart detected for session {session_id}")
@@ -172,8 +395,17 @@ class ReasoningEngine:
                 reasoning_chain=["Conversation restart detected", "Route to general assistant"]
             )
 
-        # Build unified reasoning prompt
-        prompt = self._build_reasoning_prompt(user_message, memory, patient_info or {})
+        # Build unified reasoning prompt with continuation context
+        prompt = self._build_reasoning_prompt(
+            user_message, 
+            memory, 
+            patient_info or {},
+            continuation_context=continuation_context
+        )
+        logger.info(">" * 80)
+        logger.info(f"🧠 Reasoning Prompt: {prompt}")
+        logger.info(">" * 80)
+
         
         # Get observability logger
         obs_logger = get_observability_logger(session_id) if settings.enable_observability else None
@@ -248,8 +480,14 @@ class ReasoningEngine:
                     "tokens_used": tokens.total_tokens
                 })
 
-            # Parse and validate response
-            output = self._parse_reasoning_response(response, user_message, memory)
+            # Parse and validate response with continuation awareness
+            output = self._parse_reasoning_response(
+                response, 
+                user_message, 
+                memory,
+                continuation_context=continuation_context,
+                continuation_detection=continuation_detection
+            )
 
             # [CRITICAL] Inject language context into minimal_context
             # This ensures ALL agents receive language awareness
@@ -270,6 +508,8 @@ class ReasoningEngine:
                 reasoning_tracker.set_understanding({
                     "what_user_means": output.understanding.what_user_means,
                     "is_continuation": output.understanding.is_continuation,
+                    "continuation_type": output.understanding.continuation_type,
+                    "selected_option": output.understanding.selected_option,
                     "sentiment": output.understanding.sentiment,
                     "is_conversation_restart": output.understanding.is_conversation_restart
                 })
@@ -340,6 +580,10 @@ class ReasoningEngine:
             logger.info(f"RESPONSE_GUIDANCE:")
             logger.info(f"  - tone: {output.response_guidance.tone}")
             logger.info(f"  - minimal_context: {json.dumps(output.response_guidance.minimal_context, indent=4)}")
+            logger.info(f"  - task_context.user_intent: {output.response_guidance.task_context.user_intent}")
+            logger.info(f"  - task_context.entities: {json.dumps(output.response_guidance.task_context.entities, indent=4)}")
+            logger.info(f"  - task_context.success_criteria: {output.response_guidance.task_context.success_criteria}")
+            logger.info(f"  - task_context.is_continuation: {output.response_guidance.task_context.is_continuation}")
             logger.info(f"  - plan: {output.response_guidance.plan}")
             logger.info(f"REASONING_CHAIN:")
             for i, step in enumerate(output.reasoning_chain, 1):
@@ -378,15 +622,32 @@ Always respond with your reasoning in the specified JSON format."""
         self,
         user_message: str,
         memory: Any,
-        patient_info: Dict[str, Any]
+        patient_info: Dict[str, Any],
+        continuation_context: Optional[Dict[str, Any]] = None
     ) -> str:
-        """Build the unified reasoning prompt."""
+        """Build the unified reasoning prompt with continuation awareness."""
 
         # Format recent turns
         recent_turns_formatted = "\n".join([
             f"{'User' if turn.role == 'user' else 'Assistant'}: {turn.content}"
             for turn in memory.recent_turns
         ])
+
+        # Continuation context section
+        continuation_section = ""
+        if continuation_context:
+            continuation_section = f"""
+═══════════════════════════════════════════════════════════════
+CONTINUATION CONTEXT (Previous flow was interrupted)
+═══════════════════════════════════════════════════════════════
+
+The system is waiting for: {continuation_context.get('awaiting', 'user response')}
+Options presented to user: {json.dumps(continuation_context.get('presented_options', []), indent=2)}
+Original request: {continuation_context.get('original_request', 'Unknown')}
+Resolved so far: {json.dumps(continuation_context.get('resolved_entities', {}), indent=2)}
+
+IMPORTANT: Check if user's message is a response to the above!
+"""
 
         return f"""Analyze this conversation situation and respond with ONE complete JSON.
 
@@ -406,7 +667,7 @@ CONVERSATION STATE
 **System State:**
 - Last Action: {memory.last_action or "None"}
 - Awaiting Response: {memory.awaiting or "Nothing specific"}
-
+{continuation_section}
 ═══════════════════════════════════════════════════════════════
 PATIENT INFORMATION
 ═══════════════════════════════════════════════════════════════
@@ -422,15 +683,52 @@ NEW USER MESSAGE
 "{user_message}"
 
 ═══════════════════════════════════════════════════════════════
+CONTINUATION DETECTION RULES
+═══════════════════════════════════════════════════════════════
+
+If user's message is short (1-3 words) AND system was awaiting a response:
+- "yeah", "ok", "sure" → User CONFIRMS previous suggestion
+- "3pm", "4pm", "2:30" → User SELECTS a time from options
+- "the first one" → User selects first option
+- "no", "neither" → User REJECTS options, needs alternatives
+- "actually..." → User wants to CHANGE something
+
+When detected as continuation:
+- Set is_continuation: true
+- Set continuation_type: "selection" | "confirmation" | "rejection"
+- Extract selected_option if applicable
+- Include resolved_entities from continuation context
+
+═══════════════════════════════════════════════════════════════
 YOUR TASK
 ═══════════════════════════════════════════════════════════════
 
-Analyze and respond with ONE JSON object:
+Analyze and respond with ONLY a valid JSON object.
+
+CRITICAL RULES:
+- Output ONLY the JSON object, no other text
+- Do NOT include comments (no // or # characters)
+- Use lowercase true/false for booleans (not True/False)
+- Use null for missing values (not None or "null")
+
+PLAN GENERATION (for response_guidance.plan):
+- ALWAYS generate a plan when routing to appointment_manager
+- Plan should be 2-4 concise steps
+- Include specific tool names and actions
+- Examples:
+  * "1. Check if patient is registered (if not, redirect to registration), 2. Get doctor list, 3. Check availability for requested date/time, 4. Book appointment if available"
+  * "1. Get patient's existing appointments, 2. Display appointment details"
+  * "1. Get appointment by ID, 2. Update status to cancelled with reason"
+- For other agents, plan can be brief or empty
+
+JSON STRUCTURE:
 
 {{
     "understanding": {{
         "what_user_means": "Plain English explanation of what user actually wants",
         "is_continuation": true/false,  # Is this continuing previous topic?
+        "continuation_type": "selection/confirmation/rejection/new_request/null",
+        "selected_option": "value user selected or null",
         "sentiment": "affirmative/negative/neutral/unclear",
         "is_conversation_restart": false
     }},
@@ -446,12 +744,26 @@ Analyze and respond with ONE JSON object:
     }},
     "response_guidance": {{
         "tone": "helpful/empathetic/urgent/professional",
+        "task_context": {{
+            "user_intent": "What user wants (incorporate continuation context if resuming)",
+            "success_criteria": [
+                // Same criteria as before if resuming blocked flow
+            ],
+            "constraints": [],
+            "prior_context": "Relevant context including previous options",
+            "is_continuation": true/false,
+            "continuation_type": "selection/confirmation/rejection/null",
+            "selected_option": "The option user selected",
+            "continuation_context": {{
+                // Copy from continuation_context if resuming
+            }}
+        }},
         "minimal_context": {{
             "user_wants": "Brief what user wants",
             "action": "Suggested action",
             "prior_context": "Any relevant prior context"
         }},
-        "plan": "Short step-by-step plan for the agent. For appointment_manager, include specific steps like: 1. Check if patient is registered, 2. Get doctor list, 3. Check availability, 4. Book appointment. Keep it concise (2-4 steps max)."
+        "plan": "Short step-by-step plan for the agent."
     }},
     "reasoning_chain": [
         "Step 1: What I observe...",
@@ -468,27 +780,17 @@ KEY RULES:
 5. If user not registered and wants to book appointment → recommend registration first
 6. Short ambiguous responses like "tomorrow" → likely continuation of previous topic
 
-
-
-PLAN GENERATION (for response_guidance.plan):
-- ALWAYS generate a plan when routing to appointment_manager
-- Plan should be 2-4 concise steps
-- Include specific tool names and actions
-- Examples:
-  * "1. Check if patient is registered (if not, redirect to registration), 2. Get doctor list, 3. Check availability for requested date/time, 4. Book appointment if available"
-  * "1. Get patient's existing appointments, 2. Display appointment details"
-  * "1. Get appointment by ID, 2. Update status to cancelled with reason"
-- For other agents, plan can be brief or empty
-
 RESPOND WITH VALID JSON ONLY - NO OTHER TEXT."""
 
     def _parse_reasoning_response(
         self,
         response: str,
         user_message: str,
-        memory: Any
+        memory: Any,
+        continuation_context: Optional[Dict[str, Any]] = None,
+        continuation_detection: Optional[Dict[str, Any]] = None
     ) -> ReasoningOutput:
-        """Parse LLM response into structured reasoning output."""
+        """Parse LLM response into structured reasoning output with continuation awareness."""
 
         try:
             # Extract JSON from response
@@ -496,14 +798,137 @@ RESPOND WITH VALID JSON ONLY - NO OTHER TEXT."""
             if not json_match:
                 raise ValueError("No JSON found in response")
 
-            data = json.loads(json_match.group())
+            json_str = json_match.group()
+
+            # Try direct parse first
+            try:
+                data = json.loads(json_str)
+            except json.JSONDecodeError as e:
+                logger.warning(f"Initial JSON parse failed: {e}")
+                
+                # Apply repairs
+                repaired = json_str
+                
+                # Remove // comments
+                repaired = re.sub(r'//[^\n]*', '', repaired)
+                
+                # Remove # comments  
+                repaired = re.sub(r'#[^\n]*', '', repaired)
+                
+                # Fix Python-style booleans/None
+                repaired = re.sub(r'\bTrue\b', 'true', repaired)
+                repaired = re.sub(r'\bFalse\b', 'false', repaired)
+                repaired = re.sub(r'\bNone\b', 'null', repaired)
+                
+                # Fix trailing commas
+                repaired = re.sub(r',(\s*[}\]])', r'\1', repaired)
+                
+                # Fix missing commas
+                repaired = re.sub(r'"\s*\n\s*"', '",\n"', repaired)
+                repaired = re.sub(r'(\}})\s*\n\s*"', r'}},\n"', repaired)
+                repaired = re.sub(r'(\])\s*\n\s*"', r'],\n"', repaired)
+                
+                try:
+                    data = json.loads(repaired)
+                    logger.info("Successfully repaired JSON")
+                except json.JSONDecodeError as e2:
+                    logger.error(f"JSON repair failed: {e2}")
+                    # Use fallback instead of raising
+                    logger.warning(f"Using fallback reasoning for: {user_message[:50]}")
+                    return self._fallback_reasoning(user_message, memory, {})
 
             # Parse nested structures
-            understanding = UnderstandingResult(**data.get("understanding", {}))
-            routing = RoutingResult(**data.get("routing", {}))
-            memory_updates = MemoryUpdate(**data.get("memory_updates", {}))
-            response_guidance = ResponseGuidance(**data.get("response_guidance", {}))
+            understanding_data = data.get("understanding", {})
+            routing_data = data.get("routing", {})
+            memory_data = data.get("memory_updates", {})
+            guidance_data = data.get("response_guidance", {}) or {}
+            task_context_data = guidance_data.get("task_context", {}) or {}
             reasoning_chain = data.get("reasoning_chain", [])
+
+            # Enhance with continuation detection if LLM missed it
+            is_continuation = understanding_data.get("is_continuation", False)
+            continuation_type = understanding_data.get("continuation_type")
+            selected_option = understanding_data.get("selected_option")
+
+            # Use pre-detection if LLM didn't detect continuation
+            if continuation_detection and continuation_detection.get("is_continuation"):
+                if not is_continuation or continuation_detection.get("confidence", 0) > 0.8:
+                    is_continuation = True
+                    if not continuation_type:
+                        continuation_type = continuation_detection.get("continuation_type")
+                    if not selected_option:
+                        selected_option = continuation_detection.get("selected_option")
+                    logger.info(f"Using pre-detected continuation: {continuation_type}")
+
+            understanding_data["is_continuation"] = is_continuation
+            understanding_data["continuation_type"] = continuation_type
+            understanding_data["selected_option"] = selected_option
+
+            understanding = UnderstandingResult(**understanding_data)
+            routing = RoutingResult(**routing_data)
+            memory_updates = MemoryUpdate(**memory_data)
+
+            # Handle task_context - merge resolved entities from continuation context
+            if continuation_context and is_continuation:
+                resolved_entities = continuation_context.get("resolved_entities", {})
+                if resolved_entities:
+                    # Merge resolved entities into task_context entities
+                    if "entities" not in task_context_data:
+                        task_context_data["entities"] = {}
+                    task_context_data["entities"].update(resolved_entities)
+                    logger.info(f"🔄 [ReasoningEngine] Merged {len(resolved_entities)} resolved entities from continuation: {json.dumps(resolved_entities, default=str)}")
+
+                # Add selected option to entities if applicable
+                if selected_option and continuation_type == "selection":
+                    if "entities" not in task_context_data:
+                        task_context_data["entities"] = {}
+                    # Add selected option based on what was awaited
+                    awaiting = continuation_context.get("awaiting", "")
+                    if "time" in awaiting.lower():
+                        task_context_data["entities"]["selected_time"] = selected_option
+                    elif "doctor" in awaiting.lower():
+                        task_context_data["entities"]["selected_doctor"] = selected_option
+                    else:
+                        task_context_data["entities"]["selected_option"] = selected_option
+
+            # Ensure task_context is created
+            if not task_context_data:
+                task_context_data = {}
+
+            # Clean None values that should be empty dicts/lists
+            # (LLM may return null instead of omitting the field)
+            if task_context_data.get("continuation_context") is None:
+                task_context_data["continuation_context"] = {}
+            if task_context_data.get("entities") is None:
+                task_context_data["entities"] = {}
+            if task_context_data.get("success_criteria") is None:
+                task_context_data["success_criteria"] = []
+            if task_context_data.get("constraints") is None:
+                task_context_data["constraints"] = []
+
+            # Create TaskContext
+            task_context = TaskContext(**task_context_data)
+
+            # Log entities extracted by reasoning engine
+            entities = task_context_data.get("entities", {})
+            if entities:
+                logger.info(f"📊 [ReasoningEngine] Extracted entities from user message: {json.dumps(entities, default=str)}")
+            else:
+                logger.info(f"📊 [ReasoningEngine] No entities extracted from user message")
+
+            # Create ResponseGuidance from guidance_data
+            # Extract fields from guidance_data with safe defaults
+            tone = guidance_data.get("tone", "helpful")
+            minimal_context = guidance_data.get("minimal_context", {})
+            plan = guidance_data.get("plan", "")
+            
+            # Create ResponseGuidance object
+            response_guidance = ResponseGuidance(
+                tone=tone,
+                task_context=task_context,
+                minimal_context=minimal_context,
+                plan=plan
+            )
 
             # Create output
             output = ReasoningOutput(
